@@ -9,11 +9,16 @@ from app.browser.xhs_fetcher import (
     SEARCH_API,
     SEARCH_API_LEGACY,
     USER_ME_API,
+    FAVORITE_ALL_API,
+    FAVORITE_BOARDS_API,
+    _favorite_notes,
     _xhs_page_failure,
     _xhs_search_value,
     fetch_xhs_search,
     fetch_xhs_note_detail,
     fetch_xhs_self_profile,
+    fetch_xhs_favorite_boards,
+    fetch_xhs_favorites,
 )
 
 
@@ -61,6 +66,100 @@ class _Manager:
 
 
 class XhsFetcherResponseTests(unittest.TestCase):
+    def test_favorite_response_shapes_are_normalized(self):
+        self.assertEqual(_favorite_notes({"notes": [{"note_id": "n1"}]}),
+                         [{"note_id": "n1"}])
+        self.assertEqual(_favorite_notes({"items": [{"id": "n2"}]}),
+                         [{"id": "n2"}])
+
+    def test_favorite_boards_and_notes_are_captured_before_page_release(self):
+        class Response:
+            status = 200
+
+            def __init__(self, path):
+                self.url = "https://edith.xiaohongshu.com" + path
+
+            async def json(self):
+                if FAVORITE_BOARDS_API in self.url:
+                    return {"data": {"boards": [{"id": "b1", "name": "选题库", "total": 1}]}}
+                return {"data": {"notes": [{"note_id": "n1", "display_title": "收藏样本",
+                                               "xsec_token": "token-1"}]}}
+
+        class Locator:
+            first = None
+
+            def __init__(self, page, label):
+                self.first = self
+                self.page, self.label = page, label
+
+            async def is_visible(self, **_kwargs):
+                return self.label in {"收藏", "选题库"}
+
+            async def click(self):
+                path = FAVORITE_BOARDS_API if self.label == "收藏" else FAVORITE_ALL_API
+                await self.page.emit(Response(path))
+
+        class Page:
+            url = "about:blank"
+
+            def __init__(self):
+                self.listeners = []
+
+            def on(self, event, listener):
+                if event == "response":
+                    self.listeners.append(listener)
+
+            async def emit(self, response):
+                for listener in list(self.listeners):
+                    result = listener(response)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            def get_by_text(self, label, **_kwargs):
+                return Locator(self, label)
+
+        class Interaction:
+            async def scroll_step(self, *_args):
+                return None
+
+        class Manager:
+            def __init__(self):
+                self.page = Page()
+                self.xhs_interaction = Interaction()
+
+            @asynccontextmanager
+            async def visible_page(self, _identity):
+                yield self.page
+
+        async def scenario():
+            identity = Identity(account_id=1, profile_dir="fixture", platform="xhs")
+            boards, error = await fetch_xhs_favorite_boards(
+                Manager(), identity, "user-1", settle_ms=50)
+            self.assertEqual(error, "")
+            self.assertEqual(boards[0]["id"], "b1")
+
+            manager = Manager()
+            # All-favorites is emitted from the same 收藏 control for this fixture.
+            original = manager.page.get_by_text
+            def locator(label, **kwargs):
+                value = original(label, **kwargs)
+                if label == "收藏":
+                    async def click():
+                        await manager.page.emit(Response(FAVORITE_ALL_API))
+                    value.click = click
+                return value
+            manager.page.get_by_text = locator
+            notes, error = await fetch_xhs_favorites(
+                manager, identity, "user-1", max_scrolls=0)
+            self.assertEqual(error, "")
+            self.assertEqual(notes[0]["note_id"], "n1")
+            self.assertEqual(notes[0]["xsec_source"], "pc_user")
+
+        asyncio.run(scenario())
+
     def test_search_values_normalize_time_and_human_readable_likes(self):
         self.assertEqual(
             _xhs_search_value({"note_card": {"time": 1_700_000_000_000}}, "time"),

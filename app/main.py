@@ -37,6 +37,7 @@ from .browser import (BrowserManager, cookie_string_to_state,
                       interactive_channels_login, interactive_channels_creator_login,
                       fetch_self_profile, fetch_xhs_self_profile,
                       fetch_xhs_note_detail, fetch_xhs_comments,
+                       fetch_xhs_favorite_boards,
                       fetch_ks_self_profile,
                       fetch_channels_self_profile,
                       fetch_account_works, fetch_follows, fetch_dm_conversations,
@@ -98,7 +99,13 @@ from .models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       AccountActionTask, AccountStatSnapshot,
                       ShareDownloadRecord, AccountRiskState, RiskEvent, RiskAdminAudit,
                       KeywordCollectionJob, KeywordCollectionContent,
-                      KeywordCollectionComment)
+                       KeywordCollectionComment, AccountOperationLog,
+                       GroupConversation, GroupMember, GroupSnapshot,
+                       GroupMemberEvent, LiveLead, WebhookSubscription,
+                       WebhookEvent)
+from .event_center import dispatch_event, dispatch_pending, emit_event
+from .group_snapshots import ingest_group_snapshot
+from .operations import record_account_operation
 from .notifier import CHANNEL_TYPES, send_one
 from .profiles import (allocate_profile_dir, ensure_identity, migrate_identities,
                        assign_proxy_from_pool,
@@ -139,6 +146,7 @@ _file_manager_lock = threading.Lock()
 _share_download_sem = asyncio.Semaphore(2)
 _follow_sync_jobs: Dict[str, dict] = {}
 _follow_sync_tasks: Dict[str, asyncio.Task] = {}
+_webhook_delivery_task: asyncio.Task | None = None
 
 
 _ACTIVE_LOGIN_STATUSES = {"opening", "waiting", "verification", "persisted"}
@@ -453,7 +461,7 @@ def _seed_browser_runtimes() -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser, engine, im_receiver
+    global browser, engine, im_receiver, _webhook_delivery_task
     init_db(cfg.db_path)
     try:
         with get_session() as session:
@@ -538,7 +546,21 @@ async def lifespan(app: FastAPI):
     publisher = getattr(im_receiver, "publish", None)
     if callable(publisher):
         engine.set_dm_event_sink(publisher)
+    async def webhook_delivery_loop():
+        while True:
+            try:
+                await dispatch_pending(20)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[webhook] 事件投递循环异常: {exc!r}")
+            await asyncio.sleep(15)
+    _webhook_delivery_task = asyncio.create_task(webhook_delivery_loop())
     yield
+    if _webhook_delivery_task:
+        _webhook_delivery_task.cancel()
+        await asyncio.gather(_webhook_delivery_task, return_exceptions=True)
+        _webhook_delivery_task = None
     follow_tasks = [task for task in _follow_sync_tasks.values()
                     if not task.done()]
     for task in follow_tasks:
@@ -1800,10 +1822,13 @@ async def list_task_queue(platform: str | None = None, queue_type: str = "",
             loaded[model] = rows
 
         for row in loaded[KeywordCollectionJob]:
+            collection_title = (_queue_keywords(row.keywords)
+                                if row.source_type == "keyword"
+                                else row.source_name or row.source_type or "采集任务")
             add(
-                queue="collections", queue_label="关键词采集", row_id=row.id,
+                queue="collections", queue_label="内容采集", row_id=row.id,
                 row_platform=row.platform, account_id=row.account_id,
-                title=_queue_keywords(row.keywords),
+                title=collection_title,
                 detail=(f"{row.current_step or '等待执行'} · 已采集 {row.content_count} 个作品 / "
                         f"{row.comment_count} 条评论"),
                 status=row.status, created_at=row.created_at,
@@ -6445,6 +6470,9 @@ def _meta_matches(item: MonitorTarget | CommentWatch, group_name: str, tag: str)
 class KeywordCollectionIn(BaseModel):
     platform: str = "douyin"
     account_id: int
+    source_type: str = "keyword"
+    source_ref: str = ""
+    source_name: str = ""
     keywords: list[str] = PydanticField(default_factory=list)
     max_contents_per_keyword: int = 20
     max_pages_per_keyword: int = 12
@@ -6467,13 +6495,32 @@ def _validated_collection_input(body: KeywordCollectionIn) \
     platform = body.platform.strip().lower()
     if platform not in {"douyin", "xhs"}:
         raise HTTPException(400, "关键词批量采集仅支持抖音或小红书")
+    source_type = body.source_type.strip().lower() or "keyword"
+    if source_type not in {"keyword", "favorite_all", "favorite_board", "creator"}:
+        raise HTTPException(400, "采集来源须为关键词、创作者主页、全部收藏或指定收藏夹")
+    if source_type in {"favorite_all", "favorite_board"} and platform != "xhs":
+        raise HTTPException(400, "收藏来源仅支持小红书")
+    source_ref = body.source_ref.strip()
+    source_name = body.source_name.strip()
+    if source_type == "favorite_board" and not source_ref:
+        raise HTTPException(400, "指定收藏夹采集必须提供收藏夹 ID")
+    if source_type == "creator" and not source_ref:
+        raise HTTPException(400, "创作者主页采集必须提供用户 ID")
+    if len(source_ref) > 200 or len(source_name) > 120:
+        raise HTTPException(400, "采集来源标识或名称过长")
     keywords = _collection_keywords(body.keywords)
-    if not keywords:
-        raise HTTPException(400, "请至少填写一个关键词")
-    if len(keywords) > 20:
-        raise HTTPException(400, "单个任务最多包含 20 个关键词")
-    if any(len(value) > 80 for value in keywords):
-        raise HTTPException(400, "单个关键词不能超过 80 个字符")
+    if source_type == "keyword":
+        if not keywords:
+            raise HTTPException(400, "请至少填写一个关键词")
+        if len(keywords) > 20:
+            raise HTTPException(400, "单个任务最多包含 20 个关键词")
+        if any(len(value) > 80 for value in keywords):
+            raise HTTPException(400, "单个关键词不能超过 80 个字符")
+    else:
+        keywords = []
+        source_name = source_name or ("全部收藏" if source_type == "favorite_all" else
+                                      "收藏夹" if source_type == "favorite_board" else
+                                      f"创作者 {source_ref}")
     if not 1 <= body.max_contents_per_keyword <= 100:
         raise HTTPException(400, "每个关键词作品数须为 1~100")
     if not 1 <= body.max_pages_per_keyword <= 40:
@@ -6505,6 +6552,9 @@ def _validated_collection_input(body: KeywordCollectionIn) \
         except Exception as exc:
             raise HTTPException(400, f"下载目录不可用: {exc}")
     options = {
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "source_name": source_name,
         "max_pages_per_keyword": body.max_pages_per_keyword,
         "stagnant_pages": body.stagnant_pages,
         "search_sort": search_sort,
@@ -6554,9 +6604,31 @@ def _collection_job_dict(job: KeywordCollectionJob) -> dict:
         keywords = json.loads(job.keywords or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         keywords = []
-    planned = len(keywords) * max(0, job.max_contents_per_keyword)
+    source_type = str(job.source_type or "keyword")
+    total_keywords = len(keywords) if source_type == "keyword" else 1
+    planned = total_keywords * max(0, job.max_contents_per_keyword)
+    processed_keywords = min(
+        total_keywords, max(0, int(job.processed_keyword_count or 0)))
+    current_item_total = max(0, int(job.current_item_total or 0))
+    current_item_index = min(
+        current_item_total, max(0, int(job.current_item_index or 0)))
+    if job.status == "done":
+        progress_percent = 100
+    elif total_keywords:
+        current_fraction = (
+            current_item_index / current_item_total
+            if current_item_total and processed_keywords < total_keywords
+            else 0
+        )
+        progress_percent = min(
+            100, round((processed_keywords + current_fraction)
+                       * 100 / total_keywords))
+    else:
+        progress_percent = 0
     return {
         "id": job.id, "platform": job.platform, "account_id": job.account_id,
+        "source_type": source_type, "source_ref": job.source_ref,
+        "source_name": job.source_name,
         "keywords": keywords,
         "max_contents_per_keyword": job.max_contents_per_keyword,
         "max_pages_per_keyword": job.max_pages_per_keyword,
@@ -6573,6 +6645,11 @@ def _collection_job_dict(job: KeywordCollectionJob) -> dict:
         "download_dir": job.download_dir,
         "status": job.status, "current_keyword": job.current_keyword,
         "current_step": job.current_step,
+        "processed_keyword_count": processed_keywords,
+        "total_keyword_count": total_keywords,
+        "current_item_index": current_item_index,
+        "current_item_total": current_item_total,
+        "progress_percent": progress_percent,
         "content_count": job.content_count, "comment_count": job.comment_count,
         "planned_content_count": planned, "error_count": job.error_count,
         "error": _collection_error_for_display(job.error),
@@ -6696,6 +6773,50 @@ def _collection_comment_dict(row: KeywordCollectionComment) -> dict:
     }
 
 
+@app.get("/api/accounts/{account_id}/xhs/favorite-boards")
+async def list_xhs_favorite_boards(account_id: int):
+    """List the signed-in account's XHS favorite boards without exposing cookies."""
+    if browser is None or engine is None:
+        raise HTTPException(503, "采集引擎未就绪")
+    with get_session() as session:
+        account = session.get(DouyinAccount, account_id)
+        if (not account or account.platform != "xhs" or account.status != "active"
+                or not account.storage_state):
+            raise HTTPException(400, "请选择有效的小红书登录账号")
+        identity = browser.identity_for(account)
+        user_id = account.sec_uid
+        cookie = cookie_str_from_state(account.storage_state)
+        proxy = account.proxy or ""
+
+    async def read_boards():
+        if (cfg.engine.xhs_read_mode == "browser"
+                and callable(getattr(browser, "visible_page", None))):
+            return await fetch_xhs_favorite_boards(browser, identity, user_id)
+        if not has_a1(cookie):
+            return [], "小红书登录态缺少 a1，请重新扫码登录"
+        client = XhsApiClient(
+            cookie, (browser.direct_request_user_agent(identity)
+                     if callable(getattr(browser, "direct_request_user_agent", None))
+                     else identity.ua),
+            timeout=cfg.engine.request_timeout_seconds, proxy=proxy)
+        async with client.session_scope():
+            return await client.favorite_boards(user_id), ""
+
+    boards, error = await engine.guarded_interactive_read_pair(
+        account_id, OperationKind.READ_HEAVY,
+        f"favorite-boards:{account_id}", read_boards, empty_result=[])
+    if error.startswith("risk_deferred:"):
+        raise HTTPException(429, error.split(":", 1)[-1])
+    if error and not boards:
+        raise HTTPException(400, error)
+    return [{
+        "id": str(value.get("id") or value.get("board_id") or ""),
+        "name": str(value.get("name") or value.get("title") or "未命名收藏夹"),
+        "total": int(value.get("total") or value.get("note_count") or 0),
+        "images": value.get("images") or [],
+    } for value in boards if value.get("id") or value.get("board_id")]
+
+
 @app.post("/api/collections")
 async def create_keyword_collection(body: KeywordCollectionIn, request: Request = None):
     with get_session() as session:
@@ -6720,6 +6841,11 @@ async def create_keyword_collection(body: KeywordCollectionIn, request: Request 
         payload, created = submit_once(session, request=request, scope="collection", body=body, create=create)
     if engine and created:
         engine.enqueue_collection_job(payload["id"])
+        record_account_operation(
+            platform=payload["platform"], account_id=payload["account_id"],
+            task_type="collection", task_id=payload["id"], action="queued",
+            status="pending", target=payload.get("source_name") or
+            "、".join(payload.get("keywords") or []), channel="queue")
     return payload
 
 
@@ -6752,9 +6878,18 @@ async def update_keyword_collection(job_id: int, body: KeywordCollectionIn):
         job.download_dir = download_dir
         job.current_keyword = ""
         job.current_step = "配置已更新，可点击续跑"
+        job.processed_keyword_count = 0
+        job.current_item_index = 0
+        job.current_item_total = 0
         job.cancel_requested = False
         session.add(job); session.commit(); session.refresh(job)
-        return _collection_job_dict(job)
+        payload = _collection_job_dict(job)
+    record_account_operation(
+        platform=payload["platform"], account_id=payload["account_id"],
+        task_type="collection", task_id=payload["id"], action="configured",
+        status=payload["status"], target=payload.get("source_name") or
+        "、".join(payload.get("keywords") or []), channel="api")
+    return payload
 
 
 @app.get("/api/collections")
@@ -6927,7 +7062,13 @@ async def cancel_keyword_collection(job_id: int):
         else:
             job.current_step = "正在安全停止"
         session.add(job); session.commit(); session.refresh(job)
-        return _collection_job_dict(job)
+        payload = _collection_job_dict(job)
+    record_account_operation(
+        platform=payload["platform"], account_id=payload["account_id"],
+        task_type="collection", task_id=payload["id"], action="cancel_requested",
+        status=payload["status"], target=payload.get("source_name") or
+        "、".join(payload.get("keywords") or []), channel="api")
+    return payload
 
 
 @app.post("/api/collections/{job_id}/retry")
@@ -6941,6 +7082,9 @@ async def retry_keyword_collection(job_id: int):
         job.status = "pending"
         job.current_keyword = ""
         job.current_step = "等待继续"
+        job.processed_keyword_count = 0
+        job.current_item_index = 0
+        job.current_item_total = 0
         job.error_count = 0
         job.error = ""
         job.cancel_requested = False
@@ -6950,6 +7094,11 @@ async def retry_keyword_collection(job_id: int):
         payload = _collection_job_dict(job)
     if engine:
         engine.enqueue_collection_job(job_id)
+    record_account_operation(
+        platform=payload["platform"], account_id=payload["account_id"],
+        task_type="collection", task_id=payload["id"], action="requeued",
+        status="pending", target=payload.get("source_name") or
+        "、".join(payload.get("keywords") or []), channel="queue")
     return payload
 
 
@@ -10201,6 +10350,507 @@ async def batch_del_comment_tasks(body: IdsIn2):
                 s.delete(t); n += 1
         s.commit()
     return {"ok": True, "deleted": n}
+
+
+# ─────────── 统一运营工作台 / 事件中心 ───────────
+@app.get("/api/account-operations")
+async def list_account_operations(account_id: int | None = None,
+                                  platform: str = "", task_type: str = "",
+                                  limit: int = 200):
+    limit = max(1, min(int(limit or 200), 1000))
+    with get_session() as session:
+        stmt = select(AccountOperationLog)
+        if account_id is not None:
+            stmt = stmt.where(AccountOperationLog.account_id == account_id)
+        if platform:
+            stmt = stmt.where(AccountOperationLog.platform == platform)
+        if task_type:
+            stmt = stmt.where(AccountOperationLog.task_type == task_type)
+        rows = session.exec(stmt.order_by(
+            AccountOperationLog.created_at.desc()).limit(limit)).all()
+    return [{
+        "id": row.id, "platform": row.platform, "account_id": row.account_id,
+        "task_type": row.task_type, "task_id": row.task_id,
+        "action": row.action, "target": row.target, "channel": row.channel,
+        "status": row.status, "risk_signal": row.risk_signal,
+        "detail": row.detail, "duration_ms": row.duration_ms,
+        "created_at": _queue_iso(row.created_at),
+    } for row in rows]
+
+
+@app.get("/api/accounts/workbench")
+async def accounts_workbench(platform: str = ""):
+    with get_session() as session:
+        stmt = select(DouyinAccount)
+        if platform:
+            stmt = stmt.where(DouyinAccount.platform == platform)
+        accounts = session.exec(stmt.order_by(DouyinAccount.id)).all()
+        account_ids = [account.id for account in accounts]
+        rollups = {account_id: {
+            "total": 0, "pending": 0, "running": 0,
+            "blocked": 0, "failed": 0} for account_id in account_ids}
+        task_specs = (
+            (KeywordCollectionJob, {"pending"}, {"running"}),
+            (PublishTask, {"draft", "pending"}, {"publishing"}),
+            (CommentTask, {"draft", "pending"}, {"doing"}),
+            (AccountActionTask, {"draft", "pending"}, {"doing"}),
+        )
+        for model, pending_states, running_states in task_specs:
+            rows = session.exec(select(model).where(
+                model.account_id.in_(account_ids),
+                model.status.in_(list(pending_states | running_states | _QUEUE_FAILED)))).all()
+            for row in rows:
+                value = rollups[row.account_id]
+                value["total"] += 1
+                if row.status in _QUEUE_FAILED:
+                    value["failed"] += 1
+                elif (getattr(row, "blocked_reason", "")
+                      or (getattr(row, "next_allowed_at", None)
+                          and row.next_allowed_at > datetime.utcnow())):
+                    value["blocked"] += 1
+                elif row.status in running_states:
+                    value["running"] += 1
+                else:
+                    value["pending"] += 1
+        latest: dict[int, AccountOperationLog] = {}
+        for row in session.exec(select(AccountOperationLog).order_by(
+                AccountOperationLog.created_at.desc()).limit(2000)).all():
+            latest.setdefault(row.account_id, row)
+        unread = {account.id: int(session.exec(select(func.sum(
+            DmConversation.unread_count)).where(
+                DmConversation.account_id == account.id)).one() or 0)
+                  for account in accounts}
+    open_ids = set(_active_open_browser_account_ids())
+    return [{
+        "account_id": account.id, "platform": account.platform,
+        "nickname": account.nickname, "avatar": account.avatar,
+        "status": account.status, "proxy_status": account.proxy_status,
+        "browser_open": account.id in open_ids,
+        "unread_dm": unread.get(account.id, 0),
+        "tasks": rollups.get(account.id, {
+            "total": 0, "pending": 0, "running": 0, "blocked": 0, "failed": 0}),
+        "last_operation": ({
+            "action": latest[account.id].action,
+            "status": latest[account.id].status,
+            "detail": latest[account.id].detail,
+            "created_at": _queue_iso(latest[account.id].created_at),
+        } if account.id in latest else None),
+    } for account in accounts]
+
+
+@app.get("/api/dm/inbox")
+async def aggregate_dm_inbox(platform: str = "", unread_only: bool = False,
+                             limit: int = 200):
+    with get_session() as session:
+        stmt = select(DmConversation)
+        if platform:
+            stmt = stmt.where(DmConversation.platform == platform)
+        if unread_only:
+            stmt = stmt.where(DmConversation.unread_count > 0)
+        rows = session.exec(stmt.order_by(
+            DmConversation.last_time.desc()).limit(max(1, min(limit, 1000)))).all()
+        accounts = {row.id: row for row in session.exec(select(DouyinAccount)).all()}
+    items = []
+    for row in rows:
+        try:
+            raw = json.loads(row.raw_json or "{}")
+        except (TypeError, ValueError):
+            raw = {}
+        account = accounts.get(row.account_id)
+        items.append({
+            "id": row.id, "platform": row.platform, "account_id": row.account_id,
+            "account_name": account.nickname if account else "",
+            "conv_id": row.conv_id, "peer_uid": row.peer_uid,
+            "peer_nickname": row.peer_nickname, "peer_avatar": row.peer_avatar,
+            "last_text": row.last_text, "last_time": row.last_time,
+            "unread_count": row.unread_count,
+            "group_chat": bool(raw.get("group_chat") or raw.get("conversation_type") == "group"),
+        })
+    return {"items": items, "unread": sum(item["unread_count"] for item in items)}
+
+
+class GroupMemberIn(BaseModel):
+    member_id: str = ""
+    user_id: str = ""
+    uid: str = ""
+    nickname: str = ""
+    avatar: str = ""
+    role: str = "member"
+
+
+class GroupSnapshotIn(BaseModel):
+    platform: str
+    account_id: int
+    group_id: str
+    group_name: str = ""
+    members: list[GroupMemberIn] = PydanticField(default_factory=list)
+
+
+@app.post("/api/group-snapshots")
+async def create_group_snapshot(body: GroupSnapshotIn):
+    platform = body.platform.strip().lower()
+    group_id = body.group_id.strip()
+    if platform not in {"douyin", "xhs", "kuaishou"} or not group_id:
+        raise HTTPException(422, "平台或群 ID 无效")
+    with get_session() as session:
+        account = session.get(DouyinAccount, body.account_id)
+        if not account or account.platform != platform:
+            raise HTTPException(400, "账号不存在或与平台不匹配")
+    try:
+        result = ingest_group_snapshot(
+            platform=platform, account_id=body.account_id,
+            group_id=group_id, group_name=body.group_name.strip(),
+            members=[value.model_dump() for value in body.members])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    record_account_operation(
+        platform=platform, account_id=body.account_id,
+        task_type="group_snapshot", task_id=result["snapshot_id"],
+        action="snapshot", status="done", target=body.group_name or group_id,
+        channel="api", detail=(f"成员 {result['member_count']}，新增 {len(result['joined'])}，"
+                               f"退出 {len(result['left'])}，变化 {len(result['changed'])}"))
+    return result
+
+
+@app.get("/api/groups")
+async def list_groups(account_id: int | None = None, platform: str = ""):
+    with get_session() as session:
+        stmt = select(GroupConversation)
+        if account_id is not None:
+            stmt = stmt.where(GroupConversation.account_id == account_id)
+        if platform:
+            stmt = stmt.where(GroupConversation.platform == platform)
+        rows = session.exec(stmt.order_by(GroupConversation.last_snapshot_at.desc())).all()
+    return [{"id": row.id, "platform": row.platform, "account_id": row.account_id,
+             "group_id": row.group_id, "name": row.name,
+             "member_count": row.member_count,
+             "last_snapshot_at": _queue_iso(row.last_snapshot_at)} for row in rows]
+
+
+@app.get("/api/groups/{group_id}/members")
+async def list_group_members(group_id: str, account_id: int,
+                             active_only: bool = True):
+    with get_session() as session:
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.account_id == account_id)
+        if active_only:
+            stmt = stmt.where(GroupMember.active == True)  # noqa:E712
+        rows = session.exec(stmt.order_by(GroupMember.nickname, GroupMember.member_id)).all()
+    return [{"member_id": row.member_id, "nickname": row.nickname,
+             "avatar": row.avatar, "role": row.role, "active": row.active,
+             "first_seen_at": _queue_iso(row.first_seen_at),
+             "last_seen_at": _queue_iso(row.last_seen_at),
+             "left_at": _queue_iso(row.left_at)} for row in rows]
+
+
+@app.get("/api/groups/{group_id}/events")
+async def list_group_member_events(group_id: str, account_id: int, limit: int = 200):
+    with get_session() as session:
+        rows = session.exec(select(GroupMemberEvent).where(
+            GroupMemberEvent.group_id == group_id,
+            GroupMemberEvent.account_id == account_id).order_by(
+                GroupMemberEvent.created_at.desc()).limit(max(1, min(limit, 1000)))).all()
+    return [{"id": row.id, "snapshot_id": row.snapshot_id,
+             "member_id": row.member_id, "change_type": row.change_type,
+             "before": json.loads(row.before_json or "{}"),
+             "after": json.loads(row.after_json or "{}"),
+             "created_at": _queue_iso(row.created_at)} for row in rows]
+
+
+class LiveLeadIn(BaseModel):
+    platform: str = "douyin"
+    account_id: int
+    room_id: str
+    user_id: str
+    nickname: str = ""
+    source_event: str = "comment"
+    content: str = ""
+    tags: list[str] = PydanticField(default_factory=list)
+    score: int = 0
+    occurred_at: datetime | None = None
+
+
+class LiveLeadUpdate(BaseModel):
+    status: str | None = None
+    assignee: str | None = None
+    note: str | None = None
+    tags: list[str] | None = None
+    score: int | None = None
+
+
+@app.post("/api/live-leads")
+async def create_live_lead(body: LiveLeadIn):
+    if not body.room_id.strip() or not body.user_id.strip():
+        raise HTTPException(422, "直播间 ID 和用户 ID 必填")
+    with get_session() as session:
+        account = session.get(DouyinAccount, body.account_id)
+        if not account or account.platform != body.platform:
+            raise HTTPException(400, "账号不存在或与平台不匹配")
+        row = LiveLead(
+            platform=body.platform, account_id=body.account_id,
+            room_id=body.room_id.strip(), user_id=body.user_id.strip(),
+            nickname=body.nickname.strip(), source_event=body.source_event.strip(),
+            content=body.content.strip(),
+            tags=json.dumps(_collection_keywords(body.tags), ensure_ascii=False),
+            score=max(0, min(int(body.score or 0), 100)),
+            occurred_at=body.occurred_at)
+        session.add(row); session.commit(); session.refresh(row)
+        lead_id = row.id
+    emit_event("live.lead.created", {"lead_id": lead_id, **body.model_dump(mode="json")},
+               aggregate_type="live_lead", aggregate_id=str(lead_id))
+    return {"id": lead_id, "status": "new"}
+
+
+@app.get("/api/live-leads")
+async def list_live_leads(platform: str = "", account_id: int | None = None,
+                          status: str = "", limit: int = 200):
+    with get_session() as session:
+        stmt = select(LiveLead)
+        if platform:
+            stmt = stmt.where(LiveLead.platform == platform)
+        if account_id is not None:
+            stmt = stmt.where(LiveLead.account_id == account_id)
+        if status:
+            stmt = stmt.where(LiveLead.status == status)
+        rows = session.exec(stmt.order_by(
+            LiveLead.created_at.desc()).limit(max(1, min(limit, 1000)))).all()
+    return [{"id": row.id, "platform": row.platform, "account_id": row.account_id,
+             "room_id": row.room_id, "user_id": row.user_id,
+             "nickname": row.nickname, "source_event": row.source_event,
+             "content": row.content, "tags": json.loads(row.tags or "[]"),
+             "score": row.score, "status": row.status, "assignee": row.assignee,
+             "note": row.note, "occurred_at": _queue_iso(row.occurred_at),
+             "updated_at": _queue_iso(row.updated_at)} for row in rows]
+
+
+@app.patch("/api/live-leads/{lead_id}")
+async def update_live_lead(lead_id: int, body: LiveLeadUpdate):
+    with get_session() as session:
+        row = session.get(LiveLead, lead_id)
+        if not row:
+            raise HTTPException(404, "直播线索不存在")
+        if body.status is not None:
+            if body.status not in {"new", "following", "won", "lost"}:
+                raise HTTPException(422, "线索状态无效")
+            row.status = body.status
+        if body.assignee is not None:
+            row.assignee = body.assignee.strip()[:120]
+        if body.note is not None:
+            row.note = body.note.strip()[:2000]
+        if body.tags is not None:
+            row.tags = json.dumps(_collection_keywords(body.tags), ensure_ascii=False)
+        if body.score is not None:
+            row.score = max(0, min(int(body.score), 100))
+        row.updated_at = datetime.utcnow()
+        session.add(row); session.commit(); session.refresh(row)
+        status = row.status
+    emit_event("live.lead.updated", {"lead_id": lead_id, "status": status},
+               aggregate_type="live_lead", aggregate_id=str(lead_id))
+    return {"ok": True, "id": lead_id, "status": status}
+
+
+@app.get("/api/browser-grid")
+async def browser_grid():
+    open_ids = set(_active_open_browser_account_ids())
+    with get_session() as session:
+        accounts = session.exec(select(DouyinAccount).order_by(DouyinAccount.id)).all()
+        running = {row.account_id for row in session.exec(select(KeywordCollectionJob).where(
+            KeywordCollectionJob.status == "running")).all()}
+    return [{"account_id": row.id, "platform": row.platform,
+             "nickname": row.nickname, "avatar": row.avatar,
+             "account_status": row.status, "proxy_status": row.proxy_status,
+             "browser_status": ("open" if row.id in open_ids else
+                                "worker" if row.id in running else "closed"),
+             "open_url": f"/api/accounts/{row.id}/open-browser"} for row in accounts]
+
+
+class BatchStopItem(BaseModel):
+    queue_type: str
+    id: int
+
+
+class BatchStopIn(BaseModel):
+    items: list[BatchStopItem] = PydanticField(default_factory=list)
+    account_ids: list[int] = PydanticField(default_factory=list)
+    platform: str = ""
+
+
+@app.post("/api/task-queue/batch-stop")
+async def batch_stop_tasks(body: BatchStopIn):
+    specs = {"collections": KeywordCollectionJob, "publishes": PublishTask,
+             "comments": CommentTask, "actions": AccountActionTask}
+    requested = {(item.queue_type, item.id) for item in body.items}
+    stopped: list[dict] = []
+    skipped: list[dict] = []
+    with get_session() as session:
+        candidates = []
+        if requested:
+            for queue_type, task_id in requested:
+                model = specs.get(queue_type)
+                row = session.get(model, task_id) if model else None
+                candidates.append((queue_type, row, task_id))
+        else:
+            if not body.account_ids and not body.platform:
+                raise HTTPException(422, "请选择任务，或指定账号/平台范围")
+            for queue_type, model in specs.items():
+                stmt = select(model)
+                if body.account_ids:
+                    stmt = stmt.where(model.account_id.in_(body.account_ids))
+                if body.platform:
+                    stmt = stmt.where(model.platform == body.platform)
+                for row in session.exec(stmt).all():
+                    candidates.append((queue_type, row, row.id))
+        for queue_type, row, task_id in candidates:
+            if row is None:
+                skipped.append({"queue_type": queue_type, "id": task_id,
+                                "reason": "任务不存在"})
+                continue
+            if queue_type == "collections" and row.status == "running":
+                row.cancel_requested = True
+                row.current_step = "正在安全停止"
+            elif row.status in {"pending", "draft", "failed", "partial"}:
+                row.status = "canceled"
+                if hasattr(row, "cancel_requested"):
+                    row.cancel_requested = True
+                if hasattr(row, "current_step"):
+                    row.current_step = "已取消"
+                if hasattr(row, "scheduled_at"):
+                    row.scheduled_at = None
+                if hasattr(row, "finished_at"):
+                    row.finished_at = datetime.utcnow()
+            else:
+                skipped.append({"queue_type": queue_type, "id": task_id,
+                                "reason": f"状态 {row.status} 不支持安全停止"})
+                continue
+            session.add(row)
+            stopped.append({"queue_type": queue_type, "id": task_id,
+                            "account_id": row.account_id, "platform": row.platform,
+                            "status": row.status})
+        session.commit()
+    for item in stopped:
+        record_account_operation(
+            platform=item["platform"], account_id=item["account_id"],
+            task_type=item["queue_type"], task_id=item["id"],
+            action="batch_stop", status=item["status"], channel="api")
+    return {"ok": True, "stopped": stopped, "skipped": skipped,
+            "stopped_count": len(stopped), "skipped_count": len(skipped)}
+
+
+class WebhookSubscriptionIn(BaseModel):
+    name: str = ""
+    url: str
+    secret: str = ""
+    event_types: list[str] = PydanticField(default_factory=lambda: ["*"])
+    enabled: bool = True
+
+
+class WebhookSubscriptionUpdate(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    secret: str | None = None
+    event_types: list[str] | None = None
+    enabled: bool | None = None
+
+
+def _validate_webhook_url(value: str) -> str:
+    value = value.strip()
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise HTTPException(422, "Webhook URL 无效") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(422, "Webhook URL 必须是完整的 HTTP(S) 地址")
+    if parsed.username or parsed.password or len(value) > 2000:
+        raise HTTPException(422, "Webhook URL 不能包含账号密码且长度须合理")
+    return value
+
+
+def _webhook_subscription_dict(row: WebhookSubscription) -> dict:
+    return {"id": row.id, "name": row.name, "url": row.url,
+            "secret_configured": bool(row.secret),
+            "event_types": json.loads(row.event_types or "[]"),
+            "enabled": row.enabled, "created_at": _queue_iso(row.created_at),
+            "updated_at": _queue_iso(row.updated_at)}
+
+
+@app.get("/api/webhooks")
+async def list_webhooks():
+    with get_session() as session:
+        rows = session.exec(select(WebhookSubscription).order_by(
+            WebhookSubscription.created_at.desc())).all()
+    return [_webhook_subscription_dict(row) for row in rows]
+
+
+@app.post("/api/webhooks")
+async def create_webhook(body: WebhookSubscriptionIn):
+    with get_session() as session:
+        row = WebhookSubscription(
+            name=body.name.strip() or "Webhook", url=_validate_webhook_url(body.url),
+            secret=body.secret, event_types=json.dumps(
+                _collection_keywords(body.event_types) or ["*"]), enabled=body.enabled)
+        session.add(row); session.commit(); session.refresh(row)
+        return _webhook_subscription_dict(row)
+
+
+@app.patch("/api/webhooks/{webhook_id}")
+async def update_webhook(webhook_id: int, body: WebhookSubscriptionUpdate):
+    with get_session() as session:
+        row = session.get(WebhookSubscription, webhook_id)
+        if not row:
+            raise HTTPException(404, "Webhook 不存在")
+        if body.name is not None:
+            row.name = body.name.strip()[:120]
+        if body.url is not None:
+            row.url = _validate_webhook_url(body.url)
+        if body.secret is not None:
+            row.secret = body.secret
+        if body.event_types is not None:
+            row.event_types = json.dumps(_collection_keywords(body.event_types) or ["*"])
+        if body.enabled is not None:
+            row.enabled = body.enabled
+        row.updated_at = datetime.utcnow()
+        session.add(row); session.commit(); session.refresh(row)
+        return _webhook_subscription_dict(row)
+
+
+@app.delete("/api/webhooks/{webhook_id}")
+async def delete_webhook(webhook_id: int):
+    with get_session() as session:
+        row = session.get(WebhookSubscription, webhook_id)
+        if row:
+            session.delete(row); session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/webhook-events")
+async def list_webhook_events(status: str = "", limit: int = 200):
+    with get_session() as session:
+        stmt = select(WebhookEvent)
+        if status:
+            stmt = stmt.where(WebhookEvent.status == status)
+        rows = session.exec(stmt.order_by(
+            WebhookEvent.created_at.desc()).limit(max(1, min(limit, 1000)))).all()
+    return [{"id": row.id, "event_type": row.event_type,
+             "aggregate_type": row.aggregate_type, "aggregate_id": row.aggregate_id,
+             "payload": json.loads(row.payload_json or "{}"), "status": row.status,
+             "attempts": row.attempts, "delivered_count": row.delivered_count,
+             "last_error": row.last_error, "created_at": _queue_iso(row.created_at),
+             "delivered_at": _queue_iso(row.delivered_at)} for row in rows]
+
+
+@app.post("/api/webhook-events/{event_id}/dispatch")
+async def dispatch_webhook_event(event_id: int):
+    result = await dispatch_event(event_id)
+    if not result.get("ok") and result.get("error") == "事件不存在":
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.post("/api/webhook-events/dispatch-pending")
+async def dispatch_pending_webhook_events(limit: int = 20):
+    results = await dispatch_pending(limit)
+    return {"ok": all(value.get("ok") for value in results), "results": results}
 
 
 # ─────────── 通知渠道 ───────────

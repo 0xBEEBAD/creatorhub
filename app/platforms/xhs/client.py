@@ -231,6 +231,26 @@ class XhsApiClient:
         }
         return await self._get("/api/sns/web/v1/user_posted", params)
 
+    async def favorite_boards(self, user_id: str) -> List[dict]:
+        data = await self._get("/api/sns/web/v1/board/user", {
+            "user_id": user_id,
+            "image_formats": "jpg,webp,avif",
+        })
+        return data.get("boards") or []
+
+    async def favorite_notes(self, *, board_id: str = "", cursor: str = "",
+                             page_size: int = 30) -> dict:
+        page_size = max(1, min(50, int(page_size or 30)))
+        if board_id:
+            return await self._get("/api/sns/web/v1/board/note", {
+                "board_id": board_id, "cursor": cursor, "num": page_size,
+                "image_formats": "jpg,webp,avif",
+            })
+        return await self._get("/api/sns/web/v2/note/collect/page", {
+            "cursor": cursor, "num": page_size,
+            "image_formats": "jpg,webp,avif",
+        })
+
     async def note_comments(self, note_id: str, xsec_token: str = "",
                             cursor: str = "", xsec_source: str = "") -> dict:
         params = {

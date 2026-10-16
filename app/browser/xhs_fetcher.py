@@ -22,6 +22,9 @@ FEED_API = "/api/sns/web/v1/feed"
 COMMENT_API = "/api/sns/web/v2/comment/page"
 # 小红书网页端「当前登录用户」接口(旧的 v1/user/selfinfo 已不再用)
 USER_ME_API = "/api/sns/web/v2/user/me"
+FAVORITE_BOARDS_API = "/api/sns/web/v1/board/user"
+FAVORITE_BOARD_NOTES_API = "/api/sns/web/v1/board/note"
+FAVORITE_ALL_API = "/api/sns/web/v2/note/collect/page"
 
 _BASE = "https://www.xiaohongshu.com"
 
@@ -559,6 +562,130 @@ async def fetch_xhs_search(mgr: BrowserManager, identity: Identity, keyword: str
         field = "time" if search_sort == "latest" else "likes"
         new_items.sort(key=lambda item: _xhs_search_value(item, field), reverse=True)
     return new_items, error
+
+
+def _favorite_notes(data: dict) -> list[dict]:
+    for key in ("notes", "items", "note_list", "noteList"):
+        values = data.get(key)
+        if isinstance(values, list):
+            return [value for value in values if isinstance(value, dict)]
+    return []
+
+
+async def fetch_xhs_favorite_boards(
+        mgr: BrowserManager, identity: Identity, user_id: str,
+        settle_ms: int = 2500) -> Tuple[List[dict], str]:
+    """Open the signed-in profile and capture the favorite-board response."""
+    boards: Dict[str, dict] = {}
+    error = ""
+
+    async def on_response(resp):
+        if FAVORITE_BOARDS_API not in resp.url:
+            return
+        try:
+            data = (await resp.json()).get("data") or {}
+        except Exception:
+            return
+        for value in data.get("boards") or []:
+            board_id = str(value.get("id") or value.get("board_id") or "")
+            if board_id:
+                boards[board_id] = value
+
+    try:
+        async with _visible_page_scope(mgr, identity, False) as page:
+            page.on("response", on_response)
+            responses = _ResponseInbox(
+                page, lambda r: FAVORITE_BOARDS_API in r.url and r.status == 200)
+            await page.goto(_profile_url(user_id), wait_until="domcontentloaded", timeout=30000)
+            for label in ("收藏", "收藏夹"):
+                try:
+                    control = page.get_by_text(label, exact=True).first
+                    if await control.is_visible(timeout=1200):
+                        await control.click()
+                        break
+                except Exception:
+                    continue
+            await responses.wait(max(1500, min(10000, settle_ms)), on_response)
+            if not boards:
+                error = await _xhs_page_failure(page)
+    except Exception as exc:
+        error = f"打开收藏夹失败: {exc!r}"
+    if not boards and not error:
+        error = "未读取到收藏夹列表（账号可能没有自建收藏夹，或页面接口已调整）"
+    return list(boards.values()), error
+
+
+async def fetch_xhs_favorites(
+        mgr: BrowserManager, identity: Identity, user_id: str, *,
+        board_id: str = "", board_name: str = "", max_scrolls: int = 12,
+        stagnant_limit: int = 3) -> Tuple[List[dict], str]:
+    """Capture all favorites or one board from the user's real browser page."""
+    collected: Dict[str, dict] = {}
+    error = ""
+    endpoint = FAVORITE_BOARD_NOTES_API if board_id else FAVORITE_ALL_API
+
+    async def on_response(resp):
+        if endpoint not in resp.url:
+            return
+        try:
+            data = (await resp.json()).get("data") or {}
+        except Exception:
+            return
+        for value in _favorite_notes(data):
+            note_id = str(value.get("note_id") or value.get("id")
+                          or (value.get("note_card") or {}).get("note_id") or "")
+            if note_id:
+                value.setdefault("xsec_source", "pc_user")
+                collected[note_id] = value
+
+    try:
+        async with _visible_page_scope(mgr, identity, False) as page:
+            page.on("response", on_response)
+            responses = _ResponseInbox(
+                page, lambda r: endpoint in r.url and r.status == 200)
+            await page.goto(_profile_url(user_id), wait_until="domcontentloaded", timeout=30000)
+            for label in ("收藏", "收藏夹"):
+                try:
+                    control = page.get_by_text(label, exact=True).first
+                    if await control.is_visible(timeout=1200):
+                        await control.click()
+                        break
+                except Exception:
+                    continue
+            if board_id:
+                # The web UI signs board/note only when a board is opened. Prefer
+                # the displayed name; data-id selectors cover compact board cards.
+                opened = False
+                if board_name:
+                    try:
+                        board = page.get_by_text(board_name, exact=True).first
+                        if await board.is_visible(timeout=2500):
+                            await board.click()
+                            opened = True
+                    except Exception:
+                        pass
+                if not opened:
+                    for selector in (f'[data-board-id="{board_id}"]',
+                                     f'[href*="{board_id}"]'):
+                        try:
+                            board = page.locator(selector).first
+                            if await board.is_visible(timeout=1200):
+                                await board.click()
+                                break
+                        except Exception:
+                            continue
+            await responses.wait(10000, on_response)
+            if not collected:
+                error = await _xhs_page_failure(page)
+            if not error:
+                await _scroll_collection(
+                    mgr, page, collected, max_scrolls,
+                    stagnant_limit=stagnant_limit)
+    except Exception as exc:
+        error = f"读取收藏笔记失败: {exc!r}"
+    if not collected and not error:
+        error = "未读取到收藏笔记（收藏夹可能为空，或页面接口已调整）"
+    return list(collected.values()), error
 
 
 async def fetch_xhs_note_detail(mgr: BrowserManager, identity: Identity, note_id: str,

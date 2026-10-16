@@ -354,6 +354,9 @@ class KeywordCollectionJob(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(default="douyin", index=True)  # douyin | xhs
     account_id: int = Field(index=True)
+    source_type: str = Field(default="keyword", index=True)  # keyword | creator | favorite_all | favorite_board
+    source_ref: str = ""              # 收藏夹 id 等平台来源标识
+    source_name: str = ""             # 面向用户的来源名称
     keywords: str = "[]"                 # JSON 字符串数组
     max_contents_per_keyword: int = 20
     max_pages_per_keyword: int = 12       # 抖音搜索为滚动加载；页面上以“深度页”表达
@@ -371,6 +374,9 @@ class KeywordCollectionJob(SQLModel, table=True):
     status: str = Field(default="pending", index=True)  # pending | running | done | partial | failed | canceled
     current_keyword: str = ""
     current_step: str = "等待执行"
+    processed_keyword_count: int = 0
+    current_item_index: int = 0
+    current_item_total: int = 0
     content_count: int = 0
     comment_count: int = 0
     error_count: int = 0
@@ -425,6 +431,133 @@ class KeywordCollectionComment(SQLModel, table=True):
     create_time: int = 0
     reply_to: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class AccountOperationLog(SQLModel, table=True):
+    """账号维度的统一任务/操作流水，仅记录状态，不保存凭据。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="douyin", index=True)
+    account_id: int = Field(index=True)
+    task_type: str = Field(default="collection", index=True)
+    task_id: str = Field(default="", index=True)
+    action: str = Field(default="", index=True)
+    target: str = ""
+    channel: str = ""
+    status: str = Field(default="info", index=True)
+    risk_signal: str = ""
+    detail: str = ""
+    duration_ms: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class GroupConversation(SQLModel, table=True):
+    """已纳入成员监控的群会话。"""
+    __table_args__ = (
+        Index("ux_group_conversation_scope", "platform", "account_id", "group_id", unique=True),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="xhs", index=True)
+    account_id: int = Field(index=True)
+    group_id: str = Field(default="", index=True)
+    name: str = ""
+    member_count: int = 0
+    last_snapshot_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class GroupMember(SQLModel, table=True):
+    """群成员的当前态；离群后保留记录用于审计。"""
+    __table_args__ = (
+        Index("ux_group_member_scope", "platform", "account_id", "group_id", "member_id", unique=True),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="xhs", index=True)
+    account_id: int = Field(index=True)
+    group_id: str = Field(default="", index=True)
+    member_id: str = Field(default="", index=True)
+    nickname: str = ""
+    avatar: str = ""
+    role: str = "member"
+    active: bool = Field(default=True, index=True)
+    raw_json: str = "{}"
+    first_seen_at: datetime = Field(default_factory=datetime.utcnow)
+    last_seen_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    left_at: Optional[datetime] = None
+
+
+class GroupSnapshot(SQLModel, table=True):
+    """一次群成员快照的汇总。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="xhs", index=True)
+    account_id: int = Field(index=True)
+    group_id: str = Field(default="", index=True)
+    member_count: int = 0
+    joined_count: int = 0
+    left_count: int = 0
+    changed_count: int = 0
+    payload_hash: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class GroupMemberEvent(SQLModel, table=True):
+    """两次群成员快照之间的加入、退出或资料变化。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    snapshot_id: int = Field(index=True)
+    platform: str = Field(default="xhs", index=True)
+    account_id: int = Field(index=True)
+    group_id: str = Field(default="", index=True)
+    member_id: str = Field(default="", index=True)
+    change_type: str = Field(default="changed", index=True)  # joined | left | changed
+    before_json: str = "{}"
+    after_json: str = "{}"
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class LiveLead(SQLModel, table=True):
+    """直播间发现的线索及人工跟进状态。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="douyin", index=True)
+    account_id: int = Field(index=True)
+    room_id: str = Field(default="", index=True)
+    user_id: str = Field(default="", index=True)
+    nickname: str = ""
+    source_event: str = "comment"
+    content: str = ""
+    tags: str = "[]"
+    score: int = 0
+    status: str = Field(default="new", index=True)  # new | following | won | lost
+    assignee: str = ""
+    note: str = ""
+    occurred_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class WebhookSubscription(SQLModel, table=True):
+    """事件中心订阅；secret 仅用于 HMAC 签名且不通过读取 API 返回。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = ""
+    url: str = ""
+    secret: str = ""
+    event_types: str = "[]"
+    enabled: bool = Field(default=True, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class WebhookEvent(SQLModel, table=True):
+    """可重试的 Webhook outbox 事件。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    event_type: str = Field(default="", index=True)
+    aggregate_type: str = ""
+    aggregate_id: str = Field(default="", index=True)
+    payload_json: str = "{}"
+    status: str = Field(default="pending", index=True)  # pending | delivered | partial | failed
+    attempts: int = 0
+    delivered_count: int = 0
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    delivered_at: Optional[datetime] = None
 
 
 class DanmakuWatch(SQLModel, table=True):

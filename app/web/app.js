@@ -1818,8 +1818,9 @@ let BROWSER_RUNTIMES = [];
 let BROWSER_RUNTIME_ROOT = "";
 let MONITORS = [], WATCHES = [], CONTENTS = [];
 let COLLECTION_JOBS = [], COLLECTION_JOB_ID = 0, COLLECTION_PAGE = 1;
+let COLLECTION_FAVORITE_BOARDS = [];
 let DANMAKU_WATCHES = [];
-let CHANNELS = [], PUBLISH_TASKS = [];
+let CHANNELS = [], PUBLISH_TASKS = [], WEBHOOKS = [], WEBHOOK_EDIT_ID = 0;
 let CONTENT_SRC = "", CONTENT_GROUP = "", CONTENT_TAG = "";
 const CONTENT_SOURCE_CACHE = new Map();
 let CONTENT_RENDER_SCOPE = "";
@@ -2348,8 +2349,14 @@ function waitForAccountPaint(isCurrent) {
 }
 async function refreshAccounts() {
   const isCurrent = beginViewRequest("accounts");
-  let accs;
-  try { accs = await api("/api/accounts?platform=" + PLATFORM); }
+  let accs, workbench = [], inbox = { items: [] };
+  try {
+    [accs, workbench, inbox] = await Promise.all([
+      api("/api/accounts?platform=" + PLATFORM),
+      api("/api/accounts/workbench?platform=" + PLATFORM).catch(() => []),
+      api("/api/dm/inbox?platform=" + PLATFORM + "&limit=100").catch(() => ({ items: [] })),
+    ]);
+  }
   catch (e) {
     if (isCurrent() && !$("acc-table").querySelector("[data-account-id]")) $("acc-table").querySelector("tbody").innerHTML = empty(3, "账号暂未加载", "i-info", "检查连接后，点击页面右上角刷新。");
     return;
@@ -2358,8 +2365,11 @@ async function refreshAccounts() {
   await waitForAccountPaint(isCurrent);
   if (!isCurrent()) return;
   ACCOUNTS = accs;
+  const accountWork = new Map((workbench || []).map(value => [Number(value.account_id), value]));
   $("stat-acc").textContent = accs.length;
   $("acc-table").querySelector("tbody").innerHTML = accs.map(a => {
+    const work = accountWork.get(Number(a.id)) || { tasks: {}, unread_dm: 0, browser_open: false };
+    const task = work.tasks || {};
     const isXhs = a.platform === "xhs";
     const isKs = a.platform === "kuaishou";
     const isChannels = a.platform === "shipinhao";
@@ -2389,6 +2399,8 @@ async function refreshAccounts() {
       isXhs ? "扫码登录" : (a.login_type === "cookie" ? "Cookie 登录" : "扫码登录"),
       ...loginDetails,
       `被 ${a.monitor_count} 个监控使用`,
+      `任务 ${Number(task.pending || 0)} 待执行 / ${Number(task.running || 0)} 执行中 / ${Number(task.blocked || 0)} 受阻 / ${Number(task.failed || 0)} 失败`,
+      work.unread_dm ? `${Number(work.unread_dm)} 条未读私信` : null,
       a.created_at ? "登录于 " + new Date(a.created_at + "Z").toLocaleString() : null,
     ].filter(Boolean).join(" · ");
     const pill = isXhs
@@ -2439,7 +2451,7 @@ async function refreshAccounts() {
         <div data-account-info hidden><div class="wb-inspector-block"><h3>账号资料</h3><p>${idline}</p><p>${esc(detail)}</p></div>
           <div class="wb-inspector-block"><h3>网络与环境</h3>${proxyLine}${browserLine}${fingerprintLine}${isolationLine}${checkLine}</div></div>
       </td>
-      <td><span class="pill ${a.status}">${accountStatusLabel}</span></td>
+      <td><span class="pill ${a.status}">${accountStatusLabel}</span>${work.browser_open ? '<div class="mut" style="margin-top:6px"><span class="pill downloading">浏览器已打开</span></div>' : ""}${Number(task.total || 0) ? `<div class="mut" style="margin-top:6px">${Number(task.running || 0)} 执行中 · ${Number(task.blocked || 0)} 受阻 · ${Number(task.failed || 0)} 失败</div>` : ""}${work.unread_dm ? `<div class="mut" style="margin-top:4px">${Number(work.unread_dm)} 条未读私信</div>` : ""}</td>
       <td class="acttd wb-account-actions">
         <button class="ghost sm" onclick="openAccountHub(${a.id})" title="查看该账号的作品 / 关注 / 粉丝 / 私信">我的内容</button>
         ${a.status === "invalid" ? reloginButton : `<button class="ghost sm" onclick="openAccountBrowser(${a.id})">打开浏览器</button>`}
@@ -2460,6 +2472,12 @@ async function refreshAccounts() {
       </td>
     </tr>`;
   }).join("") || empty(3, "还没有账号", "i-user", "用上方按钮扫码登录,或粘贴 Cookie 添加一个账号");
+  if ($("dm-inbox-table")) $("dm-inbox-table").innerHTML = (inbox.items || []).map(row => `<tr>
+    <td><b>${esc(row.account_name || `账号 #${row.account_id}`)}</b><div class="mut">${esc(PF_NAME[row.platform] || row.platform)}</div></td>
+    <td><b>${esc(row.peer_nickname || row.peer_uid || "未命名会话")}</b>${row.group_chat ? '<div class="mut">群聊</div>' : ""}${row.unread_count ? `<span class="pill pending">${Number(row.unread_count)} 未读</span>` : ""}</td>
+    <td title="${esc(row.last_text || "")}">${esc((row.last_text || "暂无文本消息").slice(0, 120))}</td>
+    <td>${row.last_time ? fmtTime(row.last_time) : "—"}</td>
+    <td class="acttd"><button class="ghost sm" onclick="openAggregatedDm(${Number(row.account_id)},${jsArg(row.conv_id)})">${ic("i-send")}处理</button></td></tr>`).join("") || empty(5, "暂无私信会话", "i-send", "在账号管理中同步私信后，会话会聚合显示在这里");
   globalThis.CreatorHubWorkbench?.accountsUpdated?.();
   if ($("tb-acc")) $("tb-acc").textContent = accs.length;
   populateAccountSelect();
@@ -2865,6 +2883,13 @@ function openAccountHub(id) {
   refreshHubSummary();
   switchTab("hub");
   switchHubTab("myworks");   // 默认落到「我的作品」,可再切关注/粉丝/私信
+}
+function openAggregatedDm(accountId, convId) {
+  setHubAcc(accountId);
+  const select = $("hub-acc"); if (select) { select.value = HUB_ACC; select._csSync?.(); }
+  switchTab("hub");
+  switchHubTab("dm");
+  setTimeout(async () => { await refreshDmConvs(); await openDmConv(convId); }, 0);
 }
 
 function populateHubAccounts() {
@@ -5024,6 +5049,74 @@ async function refreshChannels() {
       <button class="ghost sm danger" onclick="delChannel(${c.id})">${ic("i-trash")}删除</button>
     </td></tr>`).join("") || empty(3, "还没有通知渠道", "i-bell", "配置 Bark、钉钉或 Telegram，接收新作品与评论提醒。", "notifications");
 }
+async function refreshWebhooks() {
+  if (!$("wh-table")) return;
+  try {
+    const [subscriptions, events] = await Promise.all([
+      api("/api/webhooks"), api("/api/webhook-events?limit=30"),
+    ]);
+    WEBHOOKS = subscriptions || [];
+    $("wh-table").innerHTML = WEBHOOKS.map(row => `<tr>
+      <td><b>${esc(row.name || "Webhook")}</b><div class="mut">${row.secret_configured ? "签名密钥已配置" : "未配置签名密钥"}</div></td>
+      <td><code title="${esc(row.url)}">${esc(row.url)}</code></td>
+      <td>${(row.event_types || []).map(value => `<span class="meta-chip">${esc(value)}</span>`).join("")}</td>
+      <td><span class="pill ${row.enabled ? "active" : "invalid"}">${row.enabled ? "启用" : "停用"}</span></td>
+      <td class="acttd"><button class="ghost sm" onclick="editWebhook(${row.id})">编辑</button><button class="ghost sm" onclick="toggleWebhook(${row.id},${!row.enabled})">${row.enabled ? "停用" : "启用"}</button><button class="ghost sm danger" onclick="deleteWebhook(${row.id})">${ic("i-trash")}删除</button></td></tr>`).join("") || empty(5, "还没有 Webhook 订阅", "i-bolt", "添加订阅后，账号操作和业务变化会进入事件投递队列");
+    $("wh-event-table").innerHTML = (events || []).map(row => `<tr>
+      <td><b>${esc(row.event_type)}</b></td><td>${esc([row.aggregate_type, row.aggregate_id].filter(Boolean).join(" / ") || "—")}</td>
+      <td><span class="pill ${row.status === "delivered" ? "active" : row.status === "failed" ? "invalid" : "pending"}">${esc(row.status)}</span>${row.last_error ? `<div class="mut" title="${esc(row.last_error)}">${esc(row.last_error.slice(0, 100))}</div>` : ""}</td>
+      <td>${Number(row.delivered_count || 0)} 成功 / ${Number(row.attempts || 0)} 次</td><td>${collectionDate(row.created_at)}</td>
+      <td class="acttd"><button class="ghost sm" onclick="dispatchWebhookEvent(${row.id})">${ic("i-play")}投递</button></td></tr>`).join("") || empty(6, "还没有事件", "i-inbox", "业务事件产生后会显示在这里");
+  } catch (e) { toast("Webhook 事件中心加载失败：" + e.message, "err"); }
+}
+function cancelWebhookEdit() {
+  WEBHOOK_EDIT_ID = 0;
+  ["wh-name", "wh-url", "wh-secret"].forEach(id => { if ($(id)) $(id).value = ""; });
+  if ($("wh-events")) $("wh-events").value = "*";
+  $("wh-cancel").hidden = true; $("wh-save").lastChild.textContent = "添加订阅";
+  $("wh-msg").textContent = "";
+}
+function editWebhook(id) {
+  const row = WEBHOOKS.find(value => value.id === Number(id)); if (!row) return;
+  WEBHOOK_EDIT_ID = row.id;
+  $("wh-name").value = row.name || ""; $("wh-url").value = row.url || "";
+  $("wh-events").value = (row.event_types || ["*"]).join(","); $("wh-secret").value = "";
+  $("wh-cancel").hidden = false; $("wh-save").lastChild.textContent = "保存订阅";
+  $("wh-url").focus();
+}
+async function saveWebhook() {
+  const url = $("wh-url").value.trim();
+  if (!url) { setFieldError($("wh-url"), "请填写接收地址"); return; }
+  setFieldError($("wh-url"), "");
+  const payload = { name: $("wh-name").value.trim(), url,
+    event_types: parseCollectionKeywords($("wh-events").value) };
+  const secret = $("wh-secret").value;
+  if (!WEBHOOK_EDIT_ID || secret) payload.secret = secret;
+  try {
+    await api(WEBHOOK_EDIT_ID ? `/api/webhooks/${WEBHOOK_EDIT_ID}` : "/api/webhooks", {
+      method: WEBHOOK_EDIT_ID ? "PATCH" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    toast(WEBHOOK_EDIT_ID ? "Webhook 订阅已更新" : "Webhook 订阅已添加", "ok");
+    cancelWebhookEdit(); await refreshWebhooks();
+  } catch (e) { $("wh-msg").textContent = "保存失败：" + e.message; }
+}
+async function toggleWebhook(id, enabled) {
+  try { await api(`/api/webhooks/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); await refreshWebhooks(); }
+  catch (e) { toast("更新订阅失败：" + e.message, "err"); }
+}
+async function deleteWebhook(id) {
+  if (!await uiConfirm({ title: "删除 Webhook 订阅", message: "历史事件仍会保留。", okText: "删除", danger: true })) return;
+  try { await api(`/api/webhooks/${id}`, { method: "DELETE" }); if (WEBHOOK_EDIT_ID === id) cancelWebhookEdit(); await refreshWebhooks(); }
+  catch (e) { toast("删除订阅失败：" + e.message, "err"); }
+}
+async function dispatchWebhookEvent(id) {
+  try { const result = await api(`/api/webhook-events/${id}/dispatch`, { method: "POST" }); toast(result.ok ? "事件已投递" : "事件部分投递失败", result.ok ? "ok" : "err"); await refreshWebhooks(); }
+  catch (e) { toast("事件投递失败：" + e.message, "err"); }
+}
+async function dispatchPendingWebhooks() {
+  try { const result = await api("/api/webhook-events/dispatch-pending", { method: "POST" }); toast(result.ok ? "待处理事件已投递" : "部分事件投递失败", result.ok ? "ok" : "err"); await refreshWebhooks(); }
+  catch (e) { toast("批量投递失败：" + e.message, "err"); }
+}
 async function editChannel(id, draft = null) {
   const c = CHANNELS.find(x => x.id === id); if (!c) return;
   const initial = draft || { name: c.name || "", raw: JSON.stringify(c.config || {}, null, 2) };
@@ -5079,12 +5172,61 @@ function parseCollectionKeywords(raw) {
 function collectionKeywords() {
   return parseCollectionKeywords($("col-keywords") ? $("col-keywords").value : "");
 }
+function collectionSourceValue() {
+  return $("col-source") ? ($("col-source").value || "keyword") : "keyword";
+}
+async function loadCollectionFavoriteBoards() {
+  const accountId = Number($("col-account")?.value || 0);
+  const select = $("col-board");
+  if (!select || !accountId || PLATFORM !== "xhs") return;
+  const requestedAccount = accountId;
+  select.disabled = true;
+  select.innerHTML = '<option value="">正在加载收藏夹…</option>';
+  $("col-board-help").textContent = "";
+  try {
+    const boards = await api(`/api/accounts/${accountId}/xhs/favorite-boards`);
+    if (Number($("col-account")?.value || 0) !== requestedAccount) return;
+    COLLECTION_FAVORITE_BOARDS = boards || [];
+    select.innerHTML = '<option value="">请选择收藏夹</option>' + COLLECTION_FAVORITE_BOARDS.map(board =>
+      `<option value="${esc(board.id)}">${esc(board.name)}${Number(board.total) ? `（${fmtNum(board.total)}）` : ""}</option>`).join("");
+    $("col-board-help").textContent = boards.length ? `已读取 ${boards.length} 个收藏夹` : "当前账号没有可用收藏夹";
+  } catch (e) {
+    COLLECTION_FAVORITE_BOARDS = [];
+    select.innerHTML = '<option value="">加载失败，请重新选择账号</option>';
+    $("col-board-help").textContent = e.message;
+  } finally {
+    select.disabled = false;
+    select._csSync?.();
+  }
+}
+function collectionAccountChanged() {
+  if (collectionSourceValue() === "favorite_board") loadCollectionFavoriteBoards();
+}
+function collectionSourceChanged() {
+  applyCollectionForm();
+  if (collectionSourceValue() === "favorite_board") loadCollectionFavoriteBoards();
+}
 function applyCollectionForm() {
   const enabled = !!($("col-download") && $("col-download").checked);
   if ($("col-dir-wrap")) $("col-dir-wrap").style.display = enabled ? "" : "none";
   const xhs = PLATFORM === "xhs";
-  if ($("collection-create-title")) $("collection-create-title").textContent = `新建${xhs ? "小红书" : "抖音"}关键词采集`;
-  if ($("collection-create-sub")) $("collection-create-sub").textContent = xhs ? "批量搜索笔记并抓取评论" : "批量搜索视频并抓取评论";
+  document.querySelectorAll("#col-source [data-xhs-source]").forEach(option => { option.disabled = !xhs; option.hidden = !xhs; });
+  if (!xhs && ["favorite_all", "favorite_board"].includes(collectionSourceValue())) $("col-source").value = "keyword";
+  const source = collectionSourceValue();
+  const favorite = ["favorite_all", "favorite_board"].includes(source);
+  const alternate = source !== "keyword";
+  if ($("col-keywords-wrap")) $("col-keywords-wrap").style.display = alternate ? "none" : "";
+  if ($("col-board-wrap")) $("col-board-wrap").style.display = source === "favorite_board" ? "" : "none";
+  if ($("col-source-ref-wrap")) $("col-source-ref-wrap").style.display = source === "creator" ? "" : "none";
+  if ($("collection-create-title")) {
+    // Keep the keyword copy as a stable UI contract while exposing the new sources.
+    $("collection-create-title").textContent = favorite
+      ? `新建${xhs ? "小红书" : "抖音"}收藏采集`
+      : source === "creator"
+        ? `新建${xhs ? "小红书" : "抖音"}创作者采集`
+        : `新建${xhs ? "小红书" : "抖音"}关键词采集`;
+  }
+  if ($("collection-create-sub")) $("collection-create-sub").textContent = favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : "批量搜索视频并抓取评论";
   if ($("col-page-help")) $("col-page-help").textContent = xhs ? "一页对应一次搜索结果下滑或接口翻页。" : "一页对应一次搜索结果下滑。";
   if ($("col-replies-help")) $("col-replies-help").textContent = `采集${xhs ? "小红书" : "抖音"}当前可返回的回复`;
   if ($("collection-callout-title")) $("collection-callout-title").textContent = "作品上限、采集深度和停止条件任一满足即结束";
@@ -5108,6 +5250,10 @@ function collectionDate(value) {
 }
 async function createCollection() {
   const keywords = collectionKeywords();
+  const sourceType = collectionSourceValue();
+  const board = $("col-board");
+  const sourceRef = sourceType === "favorite_board" ? (board?.value || "") : sourceType === "creator" ? ($("col-source-ref")?.value.trim() || "") : "";
+  const sourceName = sourceType === "favorite_all" ? "全部收藏" : sourceType === "favorite_board" ? (board?.selectedOptions?.[0]?.textContent || "").replace(/（[\d,.万亿]+）$/, "") : sourceType === "creator" ? `创作者 ${sourceRef}` : "";
   const accountId = Number($("col-account").value || 0);
   const contentLimit = Number($("col-content-limit").value || 0);
   const commentLimit = Number($("col-comment-limit").value || 0);
@@ -5116,7 +5262,9 @@ async function createCollection() {
   const minLikes = Number($("col-min-likes").value || 0);
   const minComments = Number($("col-min-comments").value || 0);
   let valid = true;
-  valid = setFieldError($("col-keywords"), !keywords.length ? "请至少填写一个关键词" : keywords.length > 20 ? "单个任务最多 20 个关键词" : "") && valid;
+  valid = setFieldError($("col-keywords"), sourceType === "keyword" && !keywords.length ? "请至少填写一个关键词" : keywords.length > 20 ? "单个任务最多 20 个关键词" : "") && valid;
+  if (sourceType === "favorite_board") valid = setFieldError(board, !sourceRef ? "请选择收藏夹" : "") && valid;
+  if (sourceType === "creator") valid = setFieldError($("col-source-ref"), !sourceRef ? "请填写创作者用户 ID" : "") && valid;
   valid = setFieldError($("col-account"), !accountId ? "请选择一个已登录账号" : "") && valid;
   valid = setFieldError($("col-content-limit"), contentLimit < 1 || contentLimit > 100 ? "请输入 1–100" : "") && valid;
   valid = setFieldError($("col-comment-limit"), commentLimit < 0 || commentLimit > 200 ? "请输入 0–200" : "") && valid;
@@ -5137,6 +5285,7 @@ async function createCollection() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           platform: PLATFORM, account_id: accountId, keywords,
+          source_type: sourceType, source_ref: sourceRef, source_name: sourceName,
           max_contents_per_keyword: contentLimit,
           max_pages_per_keyword: pageLimit,
           stagnant_pages: stagnantPages,
@@ -5153,8 +5302,8 @@ async function createCollection() {
         }),
       });
       $("col-create-msg").textContent = `任务 #${job.id} 已进入队列`;
-      $("col-keywords").value = "";
-      toast("关键词采集任务已创建", "ok");
+      if (sourceType === "keyword") $("col-keywords").value = "";
+      toast(`${sourceType === "keyword" ? "关键词" : sourceType === "creator" ? "创作者" : "收藏"}采集任务已创建`, "ok");
       globalThis.CreatorHubWorkbench?.completed?.("collections");
       await refreshCollections();
     } catch (e) {
@@ -5171,16 +5320,30 @@ function collectionTaskSkeleton(count = 3) {
 }
 function collectionTaskEmpty() {
   return `<div class="empty collection-task-empty"><div class="empty-ic">${ic("i-hash")}</div>
-    <div class="empty-t">还没有关键词采集任务</div><div class="empty-sub">创建任务后，这里会显示进度与采集结果。</div><button class="ghost sm" data-open-composer="collections">新建关键词采集</button></div>`;
+    <div class="empty-t">还没有采集任务</div><div class="empty-sub">可按关键词、创作者主页或小红书收藏创建任务。</div><button class="ghost sm" data-open-composer="collections">新建采集任务</button></div>`;
+}
+function collectionProgress(job) {
+  if (job.status === "done") return 100;
+  const totalKeywords = Math.max(0, Number(job.total_keyword_count || 0));
+  if (!totalKeywords) return 0;
+  const processedKeywords = Math.min(totalKeywords, Math.max(0, Number(job.processed_keyword_count || 0)));
+  const itemTotal = Math.max(0, Number(job.current_item_total || 0));
+  const itemIndex = Math.min(itemTotal, Math.max(0, Number(job.current_item_index || 0)));
+  const currentFraction = itemTotal && processedKeywords < totalKeywords ? itemIndex / itemTotal : 0;
+  return Math.min(100, Math.round((processedKeywords + currentFraction) * 100 / totalKeywords));
 }
 function renderCollectionJobs() {
   const body = $("collection-job-table"); if (!body) return;
   body.innerHTML = COLLECTION_JOBS.map(job => {
     const status = collectionStatus(job.status);
-    const planned = Math.max(1, Number(job.planned_content_count || 0));
-    const percent = Math.min(100, Math.round(Number(job.content_count || 0) * 100 / planned));
-    const keywords = (job.keywords || []).slice(0, 5).map(k => `<span class="meta-chip">${esc(k)}</span>`).join("") +
-      ((job.keywords || []).length > 5 ? `<span class="meta-chip more">+${job.keywords.length - 5}</span>` : "");
+    const percent = collectionProgress(job);
+    const sourceLabel = job.source_type === "keyword" ? "关键词" : "来源";
+    const keywordProgress = `${Number(job.processed_keyword_count || 0)}/${Number(job.total_keyword_count || 0)} ${sourceLabel}`;
+    const itemProgress = Number(job.current_item_total || 0) > 0
+      ? ` · 当前作品 ${Number(job.current_item_index || 0)}/${Number(job.current_item_total || 0)}` : "";
+    const sourceValues = job.source_type === "keyword" ? (job.keywords || []) : [job.source_name || (job.source_type === "favorite_all" ? "全部收藏" : "收藏夹")];
+    const keywords = sourceValues.slice(0, 5).map(k => `<span class="meta-chip">${esc(k)}</span>`).join("") +
+      (sourceValues.length > 5 ? `<span class="meta-chip more">+${sourceValues.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
     const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
     const canEdit = canRetry && ["douyin", "xhs"].includes(job.platform);
@@ -5191,9 +5354,9 @@ function renderCollectionJobs() {
     const threshold = [Number(job.min_likes) > 0 ? `≥${fmtNum(job.min_likes)} 赞` : "", Number(job.min_comments) > 0 ? `≥${fmtNum(job.min_comments)} 评` : ""].filter(Boolean).join(" · ");
     return `<article class="collection-task" role="listitem" aria-label="任务 ${job.id}，${status.label}">
       <div class="collection-task-meta"><div><span class="collection-task-label">任务状态</span><span class="pill ${status.cls}">${status.label}</span></div><time class="collection-task-created" datetime="${esc(job.created_at || "")}">${collectionDate(job.created_at)}</time></div>
-      <div class="collection-task-keywords"><span class="collection-task-label">关键词</span><div class="keyword-stack">${keywords}</div>${job.current_keyword ? `<div class="collection-step">当前：${esc(job.current_keyword)}</div>` : ""}</div>
-      <div class="collection-task-config"><span class="collection-task-label">采集配置</span><div class="collection-task-config-main">${job.max_contents_per_keyword} 作品/词 · ${job.max_pages_per_keyword || 12} 深度页 · ${sortLabel}</div><div class="collection-task-config-sub">${timeLabel} · ${typeLabel}${threshold ? ` · ${threshold}` : ""} · ${job.max_comments_per_content} 评论/作品<br>${job.include_replies ? "含二级评论 · " : ""}${job.download_media ? "下载媒体" : "仅采数据"} · 连续 ${job.stagnant_pages || 3} 页无新增停止</div></div>
-      <div class="collection-task-progress"><span class="collection-task-label">执行进度</span><div class="job-progress"><div class="job-progress-head"><span>${esc(job.current_step || "等待执行")}</span><b>${job.content_count}/${job.planned_content_count}</b></div><div class="progress-track" role="progressbar" aria-label="任务 ${job.id} 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><div class="progress-fill" style="width:${percent}%"></div></div><div class="collection-step">已采评论 ${fmtNum(job.comment_count)}</div></div></div>
+      <div class="collection-task-keywords"><span class="collection-task-label">${sourceLabel}</span><div class="keyword-stack">${keywords}</div>${job.current_keyword ? `<div class="collection-step">当前：${esc(job.current_keyword)}</div>` : ""}</div>
+      <div class="collection-task-config"><span class="collection-task-label">采集配置</span><div class="collection-task-config-main">${job.max_contents_per_keyword} 作品/${job.source_type === "keyword" ? "词" : "来源"} · ${job.max_pages_per_keyword || 12} 深度页${job.source_type === "keyword" ? ` · ${sortLabel}` : ""}</div><div class="collection-task-config-sub">${timeLabel} · ${typeLabel}${threshold ? ` · ${threshold}` : ""} · ${job.max_comments_per_content} 评论/作品<br>${job.include_replies ? "含二级评论 · " : ""}${job.download_media ? "下载媒体" : "仅采数据"} · 连续 ${job.stagnant_pages || 3} 页无新增停止</div></div>
+      <div class="collection-task-progress"><span class="collection-task-label">执行进度</span><div class="job-progress"><div class="job-progress-head"><span>${esc(job.current_step || "等待执行")}</span><b>${percent}%</b></div><div class="progress-track" role="progressbar" aria-label="任务 ${job.id} 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><div class="progress-fill" style="width:${percent}%"></div></div><div class="collection-step">${keywordProgress}${itemProgress} · 已采 ${fmtNum(job.content_count)} 作品 / ${fmtNum(job.comment_count)} 评论</div></div></div>
       ${job.error_count ? `<button type="button" class="collection-task-error" onclick="openCollectionResults(${job.id})" title="${esc(errorText)}">${ic("i-info")}<span class="collection-task-error-text">${job.error_count} 条异常 · ${esc(errorText)}</span><span class="collection-task-error-link">查看详情</span></button>` : ""}
       <div class="collection-task-actions" aria-label="任务 ${job.id} 操作">
         <button type="button" class="sm collection-task-primary" onclick="openCollectionResults(${job.id})">${ic("i-eye")}查看结果</button>
@@ -5235,6 +5398,9 @@ async function editCollection(jobId, draft = null) {
   const accounts = ACCOUNTS.filter(a => a.platform === job.platform && a.status !== "invalid" && a.has_storage);
   const initial = draft || {
     account_id: job.account_id,
+    source_type: job.source_type || "keyword",
+    source_ref: job.source_ref || "",
+    source_name: job.source_name || "",
     keywords: (job.keywords || []).join("\n"),
     max_contents_per_keyword: job.max_contents_per_keyword,
     max_pages_per_keyword: job.max_pages_per_keyword || 12,
@@ -5254,8 +5420,8 @@ async function editCollection(jobId, draft = null) {
     _uiResolve = resolve; _uiCancelVal = null;
     $("ui-body").innerHTML = `
       <fieldset class="ui-form-group"><legend>采集范围</legend>
-      <div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
-        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>
+      ${initial.source_type === "keyword" ? `<div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
+        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
       <div class="form-grid">
         <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`)}</select></div>
         ${job.platform === "douyin" ? '<div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}
@@ -5289,7 +5455,10 @@ async function editCollection(jobId, draft = null) {
     enhanceAllSelects($("ui-body")); csSyncAll();
     _uiGetVal = () => ({
       account_id: Number($("ecol-account").value || 0),
-      keywords: $("ecol-keywords").value,
+      source_type: initial.source_type,
+      source_ref: initial.source_ref,
+      source_name: initial.source_name,
+      keywords: $("ecol-keywords") ? $("ecol-keywords").value : "",
       max_contents_per_keyword: Number($("ecol-content-limit").value || 0),
       max_pages_per_keyword: Number($("ecol-page-limit").value || 0),
       stagnant_pages: Number($("ecol-stagnant-pages").value || 0),
@@ -5308,7 +5477,7 @@ async function editCollection(jobId, draft = null) {
       okText: "保存配置", wide: true, icon: "i-library",
       submit: value => {
         const keywords = parseCollectionKeywords(value.keywords);
-        if (!keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
+        if (value.source_type === "keyword" && !keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
         if (keywords.length > 20) uiEditorError("单个任务最多 20 个关键词", "ecol-keywords");
         if (!value.account_id) uiEditorError(`请选择一个可用${platformName}账号`, "ecol-account");
         if (value.max_contents_per_keyword < 1 || value.max_contents_per_keyword > 100) uiEditorError("每词作品上限须为 1–100", "ecol-content-limit");
@@ -5335,7 +5504,7 @@ function updateCollectionResultStats(job) {
   errorBox.style.display = errorText ? "" : "none";
   errorBox.textContent = errorText ? `最近异常：${errorText}` : "";
   $("collection-results-title").childNodes[0].nodeValue = `任务 #${job.id} 采集结果 `;
-  $("collection-results-sub").textContent = `${(job.keywords || []).join("、")} · ${collectionStatus(job.status).label}`;
+  $("collection-results-sub").textContent = `${job.source_type === "keyword" ? (job.keywords || []).join("、") : (job.source_name || "收藏来源")} · ${collectionStatus(job.status).label}`;
 }
 async function openCollectionResults(jobId) {
   const btn = evtBtn();
@@ -7736,6 +7905,7 @@ let TASK_QUEUE_PAGES = 1;
 let TASK_QUEUE_LOADING = false;
 let TASK_QUEUE_REFRESH_PENDING = false;
 let TASK_QUEUE_BADGE_LOADING = false;
+const TASK_QUEUE_SELECTED = new Set();
 
 const TASK_QUEUE_RAW_STATUS = {
   draft: "草稿待审", pending: "等待执行", running: "采集中", publishing: "发布中",
@@ -7787,7 +7957,11 @@ function taskQueueRow(item) {
   const reason = item.blocked_reason || item.error || "—";
   const reasonClass = item.error && !item.blocked_reason ? " has-error" : "";
   const signal = item.blocked_signal ? `<small>信号：${esc(item.blocked_signal)}</small>` : "";
+  const stopKey = `${item.queue_type}:${Number(item.id)}`;
+  const selectable = ["collections", "publishes", "comments", "actions"].includes(item.queue_type)
+    && !["done", "canceled", "skipped", "uncertain"].includes(item.status);
   return `<tr>
+    <td><input type="checkbox" class="queue-select" data-queue-type="${esc(item.queue_type)}" data-task-id="${Number(item.id)}" aria-label="选择任务 ${Number(item.id)}" onchange="toggleTaskQueueItem(this)"${selectable ? "" : " disabled"}${TASK_QUEUE_SELECTED.has(stopKey) ? " checked" : ""}></td>
     <td><span class="pill q bare">${esc(item.queue_label)}</span><small class="mut" style="display:block;margin-top:5px">${esc(PF_NAME[item.platform] || item.platform || "—")}</small></td>
     <td><div class="queue-copy"><b title="${esc(item.title)}">${esc(item.title)}</b>${item.detail ? `<small>${esc(item.detail)}</small>` : ""}</div></td>
     <td><div class="queue-account"><b>${esc(account)}</b>${item.account_id ? `<small>ID ${Number(item.account_id)}</small>` : ""}</div></td>
@@ -7796,6 +7970,41 @@ function taskQueueRow(item) {
     <td><div class="queue-reason${reasonClass}">${esc(reason)}${signal}${nextAllowed}</div></td>
     <td class="acttd">${item.status === "uncertain" ? `<button type="button" class="ghost sm" onclick="resolveTaskResult(${jsArg(item.queue_type)},${Number(item.id)})">核对结果</button>` : ""}<button type="button" class="ghost sm" onclick="openTaskQueueSource(${jsArg(item.source_tab)})">${esc(taskQueueSourceLabel(item.source_tab))}</button></td>
   </tr>`;
+}
+
+function updateTaskQueueSelection() {
+  const button = $("queue-batch-stop");
+  if (button) {
+    button.disabled = TASK_QUEUE_SELECTED.size === 0;
+    button.lastChild.textContent = TASK_QUEUE_SELECTED.size ? `停止所选（${TASK_QUEUE_SELECTED.size}）` : "停止所选";
+  }
+}
+function toggleTaskQueueItem(input) {
+  const key = `${input.dataset.queueType}:${Number(input.dataset.taskId)}`;
+  if (input.checked) TASK_QUEUE_SELECTED.add(key); else TASK_QUEUE_SELECTED.delete(key);
+  updateTaskQueueSelection();
+}
+function toggleTaskQueuePage(checked) {
+  document.querySelectorAll("#queue-table .queue-select:not(:disabled)").forEach(input => {
+    input.checked = checked; toggleTaskQueueItem(input);
+  });
+}
+async function batchStopSelectedTasks() {
+  if (!TASK_QUEUE_SELECTED.size) return;
+  if (!await uiConfirm({ title: "批量停止任务", message: `将安全停止 ${TASK_QUEUE_SELECTED.size} 个所选任务。执行中的发布、评论和私信不会被强制中断。`, okText: "停止所选", danger: true })) return;
+  const items = [...TASK_QUEUE_SELECTED].map(value => {
+    const split = value.lastIndexOf(":");
+    return { queue_type: value.slice(0, split), id: Number(value.slice(split + 1)) };
+  });
+  try {
+    const result = await api("/api/task-queue/batch-stop", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
+    });
+    (result.stopped || []).forEach(item => TASK_QUEUE_SELECTED.delete(`${item.queue_type}:${item.id}`));
+    toast(`已停止 ${result.stopped_count || 0} 个任务${result.skipped_count ? `，跳过 ${result.skipped_count} 个执行中任务` : ""}`, result.skipped_count ? "info" : "ok");
+    updateTaskQueueSelection();
+    await refreshTaskQueue();
+  } catch (e) { toast("批量停止失败：" + e.message, "err"); }
 }
 
 async function resolveTaskResult(queueType, id) {
@@ -7873,12 +8082,13 @@ async function refreshTaskQueue(resetPage = false) {
     if (!isCurrent()) return;
     body.innerHTML = data.items?.length
       ? data.items.map(taskQueueRow).join("")
-      : empty(7, "当前筛选范围内没有任务", "i-inbox", "切换状态或平台范围后再查看");
+      : empty(8, "当前筛选范围内没有任务", "i-inbox", "切换状态或平台范围后再查看");
+    updateTaskQueueSelection();
     renderTaskQueueSummary(data.summary || {});
     renderTaskQueuePager(data);
   } catch (e) {
     if (!isCurrent()) return;
-    body.innerHTML = empty(7, "任务队列加载失败", "i-info", e.message || "请稍后重试");
+    body.innerHTML = empty(8, "任务队列加载失败", "i-info", e.message || "请稍后重试");
     if (CURRENT_TAB === "queue") toast("任务队列加载失败：" + e.message, "err");
   } finally {
     TASK_QUEUE_LOADING = false;
@@ -8088,7 +8298,7 @@ window.CreatorHubBridge = {
       danmaku: [refreshDanmakuWatches, refreshDanmaku], collections: [refreshCollections],
       queue: [refreshTaskQueue], publish: [refreshPublish],
       autocomment: [refreshCommentRules, refreshCommentTasks],
-      notifications: [refreshChannels], settings: [loadSettings],
+      notifications: [refreshChannels, refreshWebhooks], settings: [loadSettings],
       "risk-control": [refreshRiskCenter], hub: [refreshHubSummary, refreshHubPanel],
       "share-download": [refreshShareHistory],
     };

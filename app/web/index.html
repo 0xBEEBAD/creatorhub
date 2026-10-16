@@ -1510,12 +1510,12 @@
   .queue-stat[data-tone="warn"] b { color:var(--warn); }
   .queue-stat[data-tone="danger"] b { color:var(--danger); }
   .queue-toolbar {
-    display:grid; grid-template-columns:minmax(130px,.8fr) minmax(150px,1fr) minmax(130px,.8fr) minmax(220px,1.6fr) auto;
+    display:grid; grid-template-columns:minmax(130px,.8fr) minmax(150px,1fr) minmax(130px,.8fr) minmax(220px,1.6fr) auto auto;
     gap:10px; align-items:end; margin-bottom:14px;
   }
   .queue-toolbar .form-field { min-width:0; }
   .queue-toolbar button { min-height:40px; }
-  .queue-table { min-width:1040px; table-layout:fixed; }
+  .queue-table { min-width:1084px; table-layout:fixed; }
   .queue-table .queue-col-type { width:122px; }
   .queue-table .queue-col-content { width:310px; }
   .queue-table .queue-col-account { width:150px; }
@@ -1938,6 +1938,15 @@
       <div class="table-wrap mini-table"><table id="acc-table" aria-label="平台账号列表"><tbody></tbody></table></div>
     </div>
 
+    <div class="card notsh-only">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-send"/></svg></span>
+        <h2>聚合私信 <span class="sub">当前平台所有账号 · 人工处理</span></h2>
+        <div class="right"><button class="ghost sm" type="button" onclick="refreshAccounts()"><svg><use href="#i-bolt"/></svg>刷新</button></div>
+      </div>
+      <div class="table-wrap"><table aria-label="跨账号私信收件箱"><thead><tr><th>账号</th><th>会话</th><th>最近消息</th><th>时间</th><th>操作</th></tr></thead><tbody id="dm-inbox-table"></tbody></table></div>
+    </div>
+
     <!-- 指纹 Chromium 多版本内核 -->
     <div class="card">
       <div class="card-head">
@@ -2121,10 +2130,11 @@
         <div class="form-field"><label for="queue-state">任务状态</label><select id="queue-state" onchange="refreshTaskQueue(true)"><option value="active">活动任务</option><option value="pending">等待执行</option><option value="running">正在执行</option><option value="blocked">风控延后</option><option value="failed">失败任务</option><option value="completed">已完成</option><option value="all">全部状态</option></select></div>
         <div class="form-field"><label for="queue-query">搜索</label><input id="queue-query" type="search" placeholder="任务内容、账号、错误或风控原因" onkeydown="if(event.key==='Enter'){event.preventDefault();refreshTaskQueue(true)}"></div>
         <button type="button" class="ghost" onclick="refreshTaskQueue(true)"><svg><use href="#i-bolt"/></svg>刷新</button>
+        <button type="button" class="ghost danger" id="queue-batch-stop" onclick="batchStopSelectedTasks()"><svg><use href="#i-x"/></svg>停止所选</button>
       </div>
       <div class="table-wrap" id="queue-table-wrap">
         <table class="queue-table" aria-label="任务队列明细">
-          <thead><tr><th class="queue-col-type">队列</th><th class="queue-col-content">任务内容</th><th class="queue-col-account">账号</th><th class="queue-col-time">时间</th><th class="queue-col-status">状态</th><th class="queue-col-reason">阻塞 / 错误</th><th class="queue-col-action">操作</th></tr></thead>
+          <thead><tr><th style="width:44px"><input type="checkbox" aria-label="选择本页全部任务" onchange="toggleTaskQueuePage(this.checked)"></th><th class="queue-col-type">队列</th><th class="queue-col-content">任务内容</th><th class="queue-col-account">账号</th><th class="queue-col-time">时间</th><th class="queue-col-status">状态</th><th class="queue-col-reason">阻塞 / 错误</th><th class="queue-col-action">操作</th></tr></thead>
           <tbody id="queue-table"></tbody>
         </table>
       </div>
@@ -2148,13 +2158,18 @@
         <h2><span id="collection-create-title">新建关键词采集</span> <span class="sub" id="collection-create-sub">批量搜索作品并抓取评论</span></h2>
       </div>
       <div class="stack">
-        <div class="form-field">
+        <div class="form-grid cols-4">
+          <div class="form-field"><label for="col-source">采集来源</label><select id="col-source" onchange="collectionSourceChanged()"><option value="keyword">关键词搜索</option><option value="creator">创作者主页</option><option value="favorite_all" data-xhs-source>全部收藏</option><option value="favorite_board" data-xhs-source>指定收藏夹</option></select></div>
+          <div class="form-field xhs-only" id="col-board-wrap" style="display:none"><label for="col-board">收藏夹</label><select id="col-board"><option value="">先选择账号并加载</option></select><p class="hint" id="col-board-help"></p></div>
+          <div class="form-field" id="col-source-ref-wrap" style="display:none"><label for="col-source-ref">创作者用户 ID</label><input id="col-source-ref" placeholder="抖音 sec_uid / 小红书 user_id"><p class="hint">使用公开主页作品列表，评论和下载继续沿用下方设置。</p></div>
+        </div>
+        <div class="form-field" id="col-keywords-wrap">
           <label for="col-keywords">关键词 <span class="field-scope">必填 · 最多 20 个</span></label>
           <textarea id="col-keywords" rows="5" placeholder="每行一个关键词，例如：&#10;露营装备&#10;城市骑行&#10;夏季穿搭" aria-describedby="col-keywords-help"></textarea>
           <p class="hint" id="col-keywords-help">支持换行或逗号分隔；任务会按关键词逐个执行并自动去重。</p>
         </div>
         <div class="form-grid cols-4">
-          <div class="form-field"><label for="col-account">使用账号</label><select id="col-account" required></select></div>
+          <div class="form-field"><label for="col-account">使用账号</label><select id="col-account" required onchange="collectionAccountChanged()"></select></div>
           <div class="form-field"><label for="col-content-limit">每词作品上限</label><input id="col-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
           <div class="form-field"><label for="col-comment-limit">每作品评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
           <div class="form-field dy-only"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
@@ -2978,6 +2993,24 @@
     <div class="section-divider"></div>
     <div class="data-section-head"><b>已配置渠道</b><span>可单独测试、停用或编辑</span></div>
     <div class="table-wrap mini-table"><table id="n-table" aria-label="通知渠道列表"><tbody></tbody></table></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-bolt"/></svg></span>
+      <h2>Webhook 事件中心 <span class="sub">账号操作、群成员变化与直播线索</span></h2>
+      <div class="right"><button class="ghost sm" type="button" onclick="dispatchPendingWebhooks()"><svg><use href="#i-play"/></svg>投递待处理</button></div>
+    </div>
+    <div class="form-grid cols-4">
+      <div class="form-field"><label for="wh-name">订阅名称</label><input id="wh-name" placeholder="例如 CRM 线索同步"></div>
+      <div class="form-field"><label for="wh-url">接收地址</label><input id="wh-url" type="url" placeholder="https://example.com/webhooks/creatorhub"></div>
+      <div class="form-field"><label for="wh-events">事件类型</label><input id="wh-events" value="*" placeholder="* 或逗号分隔"></div>
+      <div class="form-field"><label for="wh-secret">签名密钥</label><input id="wh-secret" type="password" autocomplete="new-password" placeholder="编辑时留空表示保留"></div>
+    </div>
+    <div class="form-actions"><span class="status-text" id="wh-msg" role="status"></span><button class="ghost" id="wh-cancel" type="button" onclick="cancelWebhookEdit()" hidden>取消编辑</button><button type="button" id="wh-save" onclick="saveWebhook()"><svg><use href="#i-check"/></svg>添加订阅</button></div>
+    <div class="section-divider"></div>
+    <div class="data-section-head"><b>订阅与最近事件</b><span>请求带 HMAC-SHA256 签名，可按事件重试</span></div>
+    <div class="table-wrap"><table aria-label="Webhook 订阅列表"><thead><tr><th>订阅</th><th>地址</th><th>事件</th><th>状态</th><th>操作</th></tr></thead><tbody id="wh-table"></tbody></table></div>
+    <div class="table-wrap" style="margin-top:12px"><table aria-label="Webhook 事件列表"><thead><tr><th>事件</th><th>对象</th><th>状态</th><th>尝试</th><th>时间</th><th>操作</th></tr></thead><tbody id="wh-event-table"></tbody></table></div>
   </div>
   </section>
 

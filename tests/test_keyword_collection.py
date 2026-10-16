@@ -33,6 +33,7 @@ from app.main import (
     KeywordCollectionIn,
     _collection_content_dict,
     _collection_error_for_display,
+    _collection_job_dict,
     _collection_keywords,
     create_keyword_collection,
     keyword_collection_content_media,
@@ -96,6 +97,26 @@ class SearchExtractionTests(unittest.TestCase):
             _collection_keywords(["露营, 骑行", "露营\n穿搭", "骑行"]),
             ["露营", "骑行", "穿搭"],
         )
+
+    def test_collection_progress_tracks_execution_instead_of_result_count(self):
+        job = KeywordCollectionJob(
+            keywords='["露营", "骑行"]',
+            max_contents_per_keyword=20,
+            status="running",
+            processed_keyword_count=1,
+            current_item_index=2,
+            current_item_total=4,
+            content_count=0,
+        )
+
+        payload = _collection_job_dict(job)
+
+        self.assertEqual(payload["total_keyword_count"], 2)
+        self.assertEqual(payload["processed_keyword_count"], 1)
+        self.assertEqual(payload["progress_percent"], 75)
+        self.assertEqual(payload["content_count"], 0)
+        job.status = "done"
+        self.assertEqual(_collection_job_dict(job)["progress_percent"], 100)
 
     def test_extracts_known_search_wrappers_and_deduplicates(self):
         first = {

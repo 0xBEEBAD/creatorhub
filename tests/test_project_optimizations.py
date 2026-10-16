@@ -113,6 +113,35 @@ def test_inflight_account_deletion_keeps_everything(local_project, model, status
         assert session.get(PublishTask, pending_id).status == "pending"
 
 
+def test_keyword_collection_progress_columns_migrate_existing_database(local_project):
+    account_id = store(DouyinAccount(platform="douyin"))
+    job_id = store(KeywordCollectionJob(
+        account_id=account_id, keywords='["fixture"]'))
+    with db._engine.begin() as connection:
+        connection.execute(text(
+            "ALTER TABLE keywordcollectionjob DROP COLUMN processed_keyword_count"))
+        connection.execute(text(
+            "ALTER TABLE keywordcollectionjob DROP COLUMN current_item_index"))
+        connection.execute(text(
+            "ALTER TABLE keywordcollectionjob DROP COLUMN current_item_total"))
+
+    db._engine.dispose()
+    db.init_db(str(local_project.path))
+
+    columns = {
+        column["name"] for column in db.inspect(db._engine).get_columns(
+            "keywordcollectionjob")
+    }
+    assert {
+        "processed_keyword_count", "current_item_index", "current_item_total",
+    } <= columns
+    with db.get_session() as session:
+        job = session.get(KeywordCollectionJob, job_id)
+        assert job.processed_keyword_count == 0
+        assert job.current_item_index == 0
+        assert job.current_item_total == 0
+
+
 def test_shared_profile_is_not_removed(local_project):
     directory = local_project.root / "profiles" / "shared"
     directory.mkdir(parents=True)

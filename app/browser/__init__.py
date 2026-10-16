@@ -11,7 +11,8 @@ from .fetcher import (fetch_videos, fetch_douyin_search,
                       fetch_self_profile, post_comment_browser)
 from .xhs_fetcher import (fetch_xhs_notes, fetch_xhs_search, fetch_xhs_note_detail,
                           fetch_xhs_comments, fetch_xhs_self_profile,
-                          fetch_creator_published)
+                           fetch_creator_published, fetch_xhs_favorite_boards,
+                           fetch_xhs_favorites)
 from .ks_fetcher import (fetch_ks_videos, fetch_ks_comments, fetch_ks_self_profile,
                          post_ks_comment)
 from .channels_fetcher import (fetch_channels_works, fetch_channels_comments,
@@ -31,6 +32,7 @@ __all__ = ["BrowserManager", "cookie_string_to_state",
            "fetch_self_profile", "post_comment_browser",
            "fetch_xhs_notes", "fetch_xhs_search", "fetch_xhs_note_detail",
            "fetch_xhs_comments", "fetch_xhs_self_profile", "fetch_creator_published",
+           "fetch_xhs_favorite_boards", "fetch_xhs_favorites",
            "fetch_ks_videos", "fetch_ks_comments", "fetch_ks_self_profile",
            "post_ks_comment",
            "fetch_channels_works", "fetch_channels_comments",

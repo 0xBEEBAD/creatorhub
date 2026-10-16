@@ -871,27 +871,38 @@ def build_share_history_report(
 def build_keyword_collection_report(job: Any, contents: Sequence[Any],
                                     comments: Sequence[Any],
                                     generated_at: datetime | None = None) -> bytes:
-    """Build one workbook containing the keyword job, content and comments."""
+    """Build one workbook containing a collection job, content and comments."""
     generated_at = generated_at or datetime.now()
     workbook = Workbook()
     _configure_workbook(workbook)
     workbook.properties.creator = "CreatorHub"
-    workbook.properties.title = "CreatorHub 关键词采集报告"
+    source_type = _text(_value(job, "source_type", "keyword")) or "keyword"
+    source_name = _text(_value(job, "source_name"))
+    source_ref = _text(_value(job, "source_ref"))
     keyword_value = _value(job, "keywords", "[]")
     try:
         keyword_text = ", ".join(json.loads(keyword_value or "[]"))
     except (TypeError, ValueError, json.JSONDecodeError):
         keyword_text = _text(keyword_value)
+    if source_type == "keyword":
+        report_title = "CreatorHub 关键词采集报告"
+        source_label = "关键词"
+        source_text = keyword_text
+    else:
+        report_title = "CreatorHub 内容采集报告"
+        source_label = "采集来源"
+        source_text = source_name or source_ref or source_type
+    workbook.properties.title = report_title
     _write_module_summary(
         workbook,
-        report_title="CreatorHub 关键词采集报告",
-        module_name="关键词采集",
+        report_title=report_title,
+        module_name="内容采集",
         detail_sheet="作品",
         record_count=len(contents),
         filters=(
             ("任务 ID", _value(job, "id")),
             ("平台", _value(job, "platform")),
-            ("关键词", keyword_text),
+            (source_label, source_text),
             ("任务状态", _value(job, "status")),
             ("作品数", len(contents)),
             ("评论数", len(comments)),
@@ -918,7 +929,7 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
         ))
     _write_table(
         workbook, "作品",
-        ("ID", "关键词", "平台", "作品ID", "描述", "作者", "媒体类型",
+        ("ID", "来源", "平台", "作品ID", "描述", "作者", "媒体类型",
          "发布时间", "点赞数", "平台评论数", "已采评论数", "下载状态",
          "本地文件", "作品链接", "错误"),
         content_rows,
@@ -941,7 +952,7 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
         ))
     _write_table(
         workbook, "评论",
-        ("ID", "关键词", "平台", "作品ID", "评论ID", "评论内容", "用户昵称",
+        ("ID", "来源", "平台", "作品ID", "评论ID", "评论内容", "用户昵称",
          "点赞数", "评论时间", "类型", "上级评论ID"),
         comment_rows,
         widths=(10, 20, 12, 24, 24, 58, 22, 12, 20, 14, 24),

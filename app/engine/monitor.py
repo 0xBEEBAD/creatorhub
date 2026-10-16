@@ -57,6 +57,7 @@ from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                        FollowEdge, DmConversation, AccountWork, AccountStatSnapshot,
                        KeywordCollectionJob)
 from ..notifier import notify_all
+from ..operations import record_account_operation
 from ..netfp import probe_ip_region
 from ..risk import (
     classify_platform_error,
@@ -858,6 +859,7 @@ class MonitorEngine:
 
     async def run_collection_job(self, job_id: int) -> dict:
         """执行一个持久化关键词任务，并维护可恢复的状态机。"""
+        started_clock = time.monotonic()
         with get_session() as s:
             job = s.get(KeywordCollectionJob, job_id)
             if not job:
@@ -867,6 +869,7 @@ class MonitorEngine:
                 job.current_step = "已取消"
                 job.finished_at = datetime.utcnow()
                 s.add(job); s.commit()
+                self._log_collection_operation(job, "canceled", "canceled")
                 return {"ok": True, "canceled": True}
             if job.status != "pending":
                 return {"ok": False, "error": f"任务状态为 {job.status}，请先通过重试入口重新排队"}
@@ -883,6 +886,7 @@ class MonitorEngine:
                 job.error_count += 1
                 job.finished_at = datetime.utcnow()
                 s.add(job); s.commit()
+                self._log_collection_operation(job, "failed", "failed", job.error)
                 return {"ok": False, "error": job.error}
             account_id = account.id
 
@@ -899,6 +903,9 @@ class MonitorEngine:
                     job.blocked_at = datetime.utcnow()
                     job.next_allowed_at = decision.next_allowed_at
                     s.add(job); s.commit()
+                    self._log_collection_operation(
+                        job, "deferred", "blocked", decision.reason,
+                        risk_signal=decision.signal)
             return {"ok": True, "deferred": True, "reason": decision.reason,
                     "signal": decision.signal,
                     "next_allowed_at": (decision.next_allowed_at.isoformat()
@@ -919,6 +926,9 @@ class MonitorEngine:
                             job.blocked_at = datetime.utcnow()
                             job.next_allowed_at = decision.next_allowed_at
                             s.add(job); s.commit()
+                            self._log_collection_operation(
+                                job, "deferred", "blocked", decision.reason,
+                                risk_signal=decision.signal)
                     return {"ok": True, "deferred": True,
                             "reason": decision.reason, "signal": decision.signal,
                             "next_allowed_at": (decision.next_allowed_at.isoformat()
@@ -939,6 +949,7 @@ class MonitorEngine:
                     job.finished_at = None
                     s.add(job); s.commit()
                     account = s.get(DouyinAccount, account_id)
+                    self._log_collection_operation(job, "started", "running")
                 result = await self.keyword_collector.run(job_id, account)
 
             with get_session() as s:
@@ -961,6 +972,7 @@ class MonitorEngine:
                 s.add(job); s.commit()
                 status = job.status
                 job_error = job.error or ""
+                log_job = job
             category, _ = classify_platform_error(job_error)
             if job_error and category in {
                     RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
@@ -974,6 +986,10 @@ class MonitorEngine:
             else:
                 self.risk.record_failure(account_id, OperationKind.READ_HEAVY,
                                          "关键词采集未取得结果")
+            self._log_collection_operation(
+                log_job, "completed" if status in {"done", "partial"} else "failed",
+                status, job_error,
+                duration_ms=int((time.monotonic() - started_clock) * 1000))
             return {"ok": status in {"done", "partial"}, "status": status, **result}
         except asyncio.CancelledError:
             with get_session() as s:
@@ -987,6 +1003,10 @@ class MonitorEngine:
                         job.status = "pending"
                         job.current_step = "服务停止，等待恢复"
                     s.add(job); s.commit()
+                    self._log_collection_operation(
+                        job, "canceled" if job.status == "canceled" else "deferred",
+                        job.status, job.current_step,
+                        duration_ms=int((time.monotonic() - started_clock) * 1000))
             raise
         except Exception as exc:
             self.risk.record_failure(account_id, OperationKind.READ_HEAVY, exc)
@@ -999,7 +1019,32 @@ class MonitorEngine:
                     job.current_step = "异常中止"
                     job.finished_at = datetime.utcnow()
                     s.add(job); s.commit()
+                    self._log_collection_operation(
+                        job, "failed", job.status, str(exc),
+                        duration_ms=int((time.monotonic() - started_clock) * 1000))
             return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def _log_collection_operation(job: KeywordCollectionJob, action: str,
+                                  status: str, detail: str = "", *,
+                                  risk_signal: str = "",
+                                  duration_ms: int = 0) -> None:
+        try:
+            if job.source_type == "keyword":
+                try:
+                    target = "、".join(json.loads(job.keywords or "[]"))
+                except (TypeError, ValueError):
+                    target = job.keywords
+            else:
+                target = job.source_name or job.source_type
+            record_account_operation(
+                platform=job.platform, account_id=job.account_id,
+                task_type="collection", task_id=job.id, action=action,
+                status=status, target=target, channel="worker",
+                risk_signal=risk_signal, detail=detail,
+                duration_ms=duration_ms)
+        except Exception:
+            log.exception("record collection operation failed for job %s", job.id)
 
     def _stamp_active(self, account_id) -> None:
         """记录账号「刚被成功摸活」的时刻。任何一次成功的网络/浏览器动作都算活跃,

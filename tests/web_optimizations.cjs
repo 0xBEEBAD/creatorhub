@@ -52,7 +52,7 @@ function fixture() {
     const selContent = new Set();
   `, context);
   for (const name of ['beginViewRequest', 'apiErrorMessage', 'scheduleToApi', 'localDateTimeValue',
-    'safeMediaUrl', 'jsArg', 'esc', 'workCard', 'refreshMyWorks', 'contentCaptureBounds', 'refreshContents', 'openDmConv']) {
+    'safeMediaUrl', 'jsArg', 'esc', 'workCard', 'refreshMyWorks', 'contentCaptureBounds', 'refreshContents', 'openDmConv', 'collectionProgress']) {
     vm.runInContext(fn(name), context, { filename: `app.js:${name}` });
   }
   return { context, $, pending, clicks, timers, run: code => vm.runInContext(code, context) };
@@ -78,6 +78,8 @@ async function run() {
   assert.equal(f.run('safeMediaUrl("data:text/html,payload")'), '');
   assert.equal(f.run('safeMediaUrl("/fixture.jpg")'), 'http://localhost/fixture.jpg');
   assert.match(f.run('apiErrorMessage([{loc:["body","scheduled_at"],msg:"invalid"}],422)'), /scheduled_at: invalid/);
+  assert.equal(f.run('collectionProgress({status:"running",total_keyword_count:2,processed_keyword_count:1,current_item_index:2,current_item_total:4,content_count:0})'), 75);
+  assert.equal(f.run('collectionProgress({status:"done",total_keyword_count:2,processed_keyword_count:0,content_count:0})'), 100);
 
   const expected = process.env.TZ === 'Asia/Shanghai' ? '2026-09-07T10:30:00.000Z' : '2026-09-07T22:30:00.000Z';
   assert.equal(f.run('scheduleToApi("2026-09-07T18:30")'), expected);

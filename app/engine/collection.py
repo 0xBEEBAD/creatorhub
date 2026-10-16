@@ -14,8 +14,11 @@ from sqlmodel import select
 from ..browser import (
     fetch_comments,
     fetch_douyin_search,
+    fetch_videos,
     fetch_xhs_comments,
+    fetch_xhs_favorites,
     fetch_xhs_note_detail,
+    fetch_xhs_notes,
     fetch_xhs_search,
 )
 from ..db import get_session
@@ -178,7 +181,10 @@ class KeywordCollector:
 
     @staticmethod
     def _progress(job_id: int, *, keyword: str | None = None,
-                  step: str | None = None) -> None:
+                  step: str | None = None,
+                  processed_keyword_count: int | None = None,
+                  current_item_index: int | None = None,
+                  current_item_total: int | None = None) -> None:
         with get_session() as session:
             job = session.get(KeywordCollectionJob, job_id)
             if not job:
@@ -187,6 +193,12 @@ class KeywordCollector:
                 job.current_keyword = keyword
             if step is not None:
                 job.current_step = step
+            if processed_keyword_count is not None:
+                job.processed_keyword_count = max(0, processed_keyword_count)
+            if current_item_index is not None:
+                job.current_item_index = max(0, current_item_index)
+            if current_item_total is not None:
+                job.current_item_total = max(0, current_item_total)
             session.add(job)
             session.commit()
 
@@ -277,6 +289,27 @@ class KeywordCollector:
             context=context,
         )
 
+    async def _discover_douyin_creator(
+            self, account, job: KeywordCollectionJob,
+            client: DouyinClient | None) -> tuple[list[dict], str]:
+        mode = str(getattr(self.cfg.engine, "douyin_read_mode", "hybrid") or "hybrid")
+        if mode in {"api", "hybrid"} and client is not None:
+            try:
+                values = await client.fetch_all_video_list(
+                    job.source_ref,
+                    max_pages=job.max_pages_per_keyword,
+                    count=min(20, job.max_contents_per_keyword))
+                if values or mode == "api":
+                    return values[:job.max_contents_per_keyword], ""
+            except Exception as exc:
+                if mode == "api":
+                    return [], f"抖音创作者作品读取失败: {exc}"
+        values, _author, error = await fetch_videos(
+            self.browser, self.browser.identity_for(account), job.source_ref, set(),
+            max_scrolls=job.max_pages_per_keyword,
+            block_media=self.cfg.engine.block_media_resources)
+        return values[:job.max_contents_per_keyword], error
+
     async def _discover_xhs(self, client: XhsApiClient, keyword: str,
                             job: KeywordCollectionJob) -> tuple[list[dict], str]:
         found: dict[str, dict] = {}
@@ -328,6 +361,88 @@ class KeywordCollector:
             block_media=self.cfg.engine.block_media_resources,
         )
         return _sort_xhs_search_items(values, job.search_sort), error
+
+    async def _discover_xhs_favorites_browser(
+            self, identity, account,
+            job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        values, error = await fetch_xhs_favorites(
+            self.browser, identity, str(getattr(account, "sec_uid", "") or ""),
+            board_id=job.source_ref if job.source_type == "favorite_board" else "",
+            board_name=job.source_name,
+            max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+            stagnant_limit=max(1, min(8, int(job.stagnant_pages or 1))),
+        )
+        return values, error
+
+    async def _discover_xhs_favorites_api(
+            self, client: XhsApiClient, job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        found: dict[str, dict] = {}
+        cursor = ""
+        pages = max(1, min(40, int(job.max_pages_per_keyword or 1)))
+        try:
+            for page in range(pages):
+                data = await client.favorite_notes(
+                    board_id=(job.source_ref if job.source_type == "favorite_board" else ""),
+                    cursor=cursor, page_size=min(50, job.max_contents_per_keyword))
+                values = data.get("notes") or data.get("items") or []
+                before = len(found)
+                for raw in values:
+                    brief = parse_note_brief(raw)
+                    if brief:
+                        raw.setdefault("xsec_source", "pc_user")
+                        found.setdefault(brief["note_id"], raw)
+                    if len(found) >= job.max_contents_per_keyword:
+                        break
+                if len(found) >= job.max_contents_per_keyword:
+                    break
+                next_cursor = str(data.get("cursor") or data.get("next_cursor") or "")
+                has_more = bool(data.get("has_more"))
+                if len(found) == before or not has_more or not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+                if page + 1 < pages:
+                    await self._xhs_gap(0.6)
+        except Exception as exc:
+            return list(found.values()), f"小红书收藏读取失败: {exc}"
+        return list(found.values()), ""
+
+    async def _discover_xhs_creator_browser(
+            self, identity, job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        values, _author, error = await fetch_xhs_notes(
+            self.browser, identity, job.source_ref, set(),
+            max_scrolls=max(1, min(40, job.max_pages_per_keyword)),
+            block_media=self.cfg.engine.block_media_resources,
+            ssr_fallback=True)
+        return values[:job.max_contents_per_keyword], error
+
+    async def _discover_xhs_creator_api(
+            self, client: XhsApiClient, job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        found: dict[str, dict] = {}
+        cursor = ""
+        try:
+            for page in range(max(1, min(40, job.max_pages_per_keyword))):
+                data = await client.notes_by_creator(
+                    job.source_ref, cursor=cursor,
+                    page_size=min(30, job.max_contents_per_keyword),
+                    xsec_source="pc_feed")
+                values = data.get("notes") or []
+                for raw in values:
+                    brief = parse_note_brief(raw)
+                    if brief:
+                        raw.setdefault("xsec_source", "pc_feed")
+                        found.setdefault(brief["note_id"], raw)
+                    if len(found) >= job.max_contents_per_keyword:
+                        break
+                next_cursor = str(data.get("cursor") or data.get("next_cursor") or "")
+                if (len(found) >= job.max_contents_per_keyword or not data.get("has_more")
+                        or not next_cursor or next_cursor == cursor):
+                    break
+                cursor = next_cursor
+                if page + 1 < job.max_pages_per_keyword:
+                    await self._xhs_gap(0.6)
+        except Exception as exc:
+            return list(found.values()), f"小红书创作者作品读取失败: {exc}"
+        return list(found.values()), ""
 
     async def _materialize_xhs(self, client: XhsApiClient, raw: dict) \
             -> tuple[Aweme | None, dict, str]:
@@ -594,8 +709,13 @@ class KeywordCollector:
         if not job:
             raise RuntimeError("采集任务不存在")
         keywords = _loads_keywords(job.keywords)
+        if job.source_type in {"favorite_all", "favorite_board", "creator"}:
+            default_name = ("全部收藏" if job.source_type == "favorite_all" else
+                            "收藏夹" if job.source_type == "favorite_board" else
+                            f"创作者 {job.source_ref}")
+            keywords = [job.source_name or default_name]
         if not keywords:
-            raise RuntimeError("采集任务没有关键词")
+            raise RuntimeError("采集任务没有可执行来源")
 
         identity = self.browser.identity_for(account)
         proxy = account.proxy or ""
@@ -654,6 +774,12 @@ class KeywordCollector:
                              context=None, identity=None) -> dict:
 
         browser_reads = self._xhs_browser_reads_enabled()
+        self._progress(
+            job_id,
+            processed_keyword_count=0,
+            current_item_index=0,
+            current_item_total=0,
+        )
         for keyword_index, keyword in enumerate(keywords):
             if self._cancel_requested(job_id):
                 return {"canceled": True, "errors": self._job(job_id).error_count}
@@ -664,17 +790,42 @@ class KeywordCollector:
             elif job.platform == "xhs" and keyword_index:
                 await self._xhs_gap(
                     self.cfg.engine.xhs_keyword_gap_seconds)
-            self._progress(job_id, keyword=keyword, step="搜索作品")
+            self._progress(
+                job_id,
+                keyword=keyword,
+                step="搜索作品",
+                processed_keyword_count=keyword_index,
+                current_item_index=0,
+                current_item_total=0,
+            )
             if job.platform == "douyin":
-                raw_items, search_error = await self._discover_douyin(
-                    account, keyword, job, client=douyin_client,
-                    context=context)
+                if job.source_type == "creator":
+                    raw_items, search_error = await self._discover_douyin_creator(
+                        account, job, douyin_client)
+                else:
+                    raw_items, search_error = await self._discover_douyin(
+                        account, keyword, job, client=douyin_client,
+                        context=context)
             elif browser_reads:
-                raw_items, search_error = await self._discover_xhs_browser(
-                    identity, keyword, job)
+                if job.source_type in {"favorite_all", "favorite_board"}:
+                    raw_items, search_error = await self._discover_xhs_favorites_browser(
+                        identity, account, job)
+                elif job.source_type == "creator":
+                    raw_items, search_error = await self._discover_xhs_creator_browser(
+                        identity, job)
+                else:
+                    raw_items, search_error = await self._discover_xhs_browser(
+                        identity, keyword, job)
             else:
-                raw_items, search_error = await self._discover_xhs(
-                    xhs_client, keyword, job)
+                if job.source_type in {"favorite_all", "favorite_board"}:
+                    raw_items, search_error = await self._discover_xhs_favorites_api(
+                        xhs_client, job)
+                elif job.source_type == "creator":
+                    raw_items, search_error = await self._discover_xhs_creator_api(
+                        xhs_client, job)
+                else:
+                    raw_items, search_error = await self._discover_xhs(
+                        xhs_client, keyword, job)
             if search_error:
                 self._record_error(job_id, f"{keyword}: {search_error}")
                 if "登录态已失效" in search_error:
@@ -685,6 +836,12 @@ class KeywordCollector:
                     # 风险/登录态/网络异常后停止后续关键词，避免一次任务继续放大信号。
                     break
             if not raw_items:
+                self._progress(
+                    job_id,
+                    processed_keyword_count=keyword_index + 1,
+                    current_item_index=0,
+                    current_item_total=0,
+                )
                 continue
 
             candidates = (raw_items[:job.max_contents_per_keyword]
@@ -695,7 +852,11 @@ class KeywordCollector:
                     return {"canceled": True, "errors": self._job(job_id).error_count}
                 self._progress(
                     job_id, keyword=keyword,
-                    step=f"处理作品 {index}/{len(candidates)}")
+                    step=f"处理作品 {index}/{len(candidates)}",
+                    processed_keyword_count=keyword_index,
+                    current_item_index=index,
+                    current_item_total=len(candidates),
+                )
                 if job.platform == "xhs" and index > 1:
                     await self._xhs_gap(self.cfg.engine.xhs_item_gap_seconds)
                 detail_error = ""
@@ -721,14 +882,18 @@ class KeywordCollector:
                     card = parts.get("card") or {}
                     detail_raw = card or raw
                     token = brief.get("xsec_token") or ""
-                    source = brief.get("xsec_source") or "pc_search"
+                    source = brief.get("xsec_source") or (
+                        "pc_feed" if job.source_type == "creator" else
+                        "pc_user" if job.source_type != "keyword" else "pc_search")
                 else:
                     aweme, parts, detail_error = await self._materialize_xhs(xhs_client, raw)
                     brief = parts.get("brief") or {}
                     card = parts.get("card") or {}
                     detail_raw = card or raw
                     token = brief.get("xsec_token") or ""
-                    source = brief.get("xsec_source") or "pc_search"
+                    source = brief.get("xsec_source") or (
+                        "pc_feed" if job.source_type == "creator" else
+                        "pc_user" if job.source_type != "keyword" else "pc_search")
                 if job.platform == "xhs" and detail_error:
                     category, _ = classify_platform_error(detail_error)
                     if category in {
@@ -789,5 +954,12 @@ class KeywordCollector:
                     await asyncio.sleep(0.4)
                 if accepted >= job.max_contents_per_keyword:
                     break
+
+            self._progress(
+                job_id,
+                processed_keyword_count=keyword_index + 1,
+                current_item_index=0,
+                current_item_total=0,
+            )
 
         return self._result(job_id)
