@@ -6763,14 +6763,75 @@ def _collection_content_dict(row: KeywordCollectionContent) -> dict:
     }
 
 
-def _collection_comment_dict(row: KeywordCollectionComment) -> dict:
-    return {
+def _collection_comment_dict(row: KeywordCollectionComment, content=None) -> dict:
+    payload = {
         "id": row.id, "job_id": row.job_id, "content_id": row.content_id,
         "aweme_id": row.aweme_id, "comment_id": row.comment_id,
         "text": row.text, "user_nickname": row.user_nickname,
+        "user_sec_uid": row.user_sec_uid, "ip_label": row.ip_label,
         "like_count": row.like_count, "create_time": row.create_time,
         "reply_to": row.reply_to,
     }
+    if content is not None:
+        payload["source_keyword"] = content.keyword or ""
+        payload["source_desc"] = content.desc or ""
+    else:
+        payload["source_keyword"] = ""
+        payload["source_desc"] = ""
+    return payload
+
+
+def _collection_comment_query(session, job_id: int, *, content_id: int | None = None,
+                              q: str = "", ip_label: str = "",
+                              user_sec_uid: str = "", dedupe_users: bool = False):
+    """Build the shared comment query used by the modal and Excel export."""
+    job = session.get(KeywordCollectionJob, job_id)
+    if not job:
+        raise HTTPException(404, "采集任务不存在")
+    conditions = [KeywordCollectionComment.job_id == job_id]
+    if content_id is not None:
+        content = session.get(KeywordCollectionContent, content_id)
+        if not content or content.job_id != job_id:
+            raise HTTPException(404, "采集作品不存在")
+        conditions.append(KeywordCollectionComment.content_id == content_id)
+    text_query = (q or "").strip()[:200]
+    region_query = (ip_label or "").strip()[:64]
+    sec_uid_query = (user_sec_uid or "").strip()[:128]
+    if text_query:
+        conditions.append(KeywordCollectionComment.text.contains(text_query))
+    if region_query:
+        conditions.append(KeywordCollectionComment.ip_label.contains(region_query))
+    if sec_uid_query:
+        conditions.append(KeywordCollectionComment.user_sec_uid.contains(sec_uid_query))
+    if dedupe_users:
+        conditions.append(func.coalesce(KeywordCollectionComment.user_sec_uid, "") != "")
+        ranked = select(
+            KeywordCollectionComment.id.label("comment_id"),
+            func.row_number().over(
+                partition_by=KeywordCollectionComment.user_sec_uid,
+                order_by=(KeywordCollectionComment.create_time.desc(),
+                          KeywordCollectionComment.id.desc()),
+            ).label("user_rank"),
+        ).where(*conditions).subquery()
+        statement = (select(KeywordCollectionComment)
+                     .join(ranked, KeywordCollectionComment.id == ranked.c.comment_id)
+                     .where(ranked.c.user_rank == 1))
+    else:
+        statement = select(KeywordCollectionComment).where(*conditions)
+    return job, statement
+
+
+def _collection_comment_payloads(session, rows):
+    content_ids = {row.content_id for row in rows if row.content_id is not None}
+    content_map = {}
+    if content_ids:
+        content_map = {
+            row.id: row for row in session.exec(
+                select(KeywordCollectionContent)
+                .where(KeywordCollectionContent.id.in_(content_ids))
+            ).all()
+        }
+    return [_collection_comment_dict(row, content_map.get(row.content_id)) for row in rows]
 
 
 @app.get("/api/accounts/{account_id}/xhs/favorite-boards")
@@ -7029,21 +7090,39 @@ async def open_keyword_collection_content(job_id: int, content_id: int,
 
 
 @app.get("/api/collections/{job_id}/comments")
-async def list_keyword_collection_comments(job_id: int, content_id: int,
-                                           limit: int = 300):
+async def list_keyword_collection_comments(job_id: int, content_id: int | None = None,
+                                           q: str = "", ip_label: str = "",
+                                           user_sec_uid: str = "",
+                                           dedupe_users: bool = False,
+                                           paginate: bool = False, page: int = 1,
+                                           page_size: int = 50, limit: int = 300):
     limit = max(1, min(limit, 1000))
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
     with get_session() as session:
-        content = session.get(KeywordCollectionContent, content_id)
-        if not content or content.job_id != job_id:
-            raise HTTPException(404, "采集作品不存在")
+        job, statement = _collection_comment_query(
+            session, job_id, content_id=content_id, q=q, ip_label=ip_label,
+            user_sec_uid=user_sec_uid, dedupe_users=dedupe_users)
+        ordering = (KeywordCollectionComment.create_time.desc(),
+                    KeywordCollectionComment.id.desc())
+        if not paginate:
+            rows = session.exec(statement.order_by(*ordering).limit(limit)).all()
+            return _collection_comment_payloads(session, rows)
+        total = int(session.exec(
+            select(func.count()).select_from(statement.subquery())
+        ).one())
+        pages = max(1, (total + page_size - 1) // page_size)
         rows = session.exec(
-            select(KeywordCollectionComment)
-            .where(KeywordCollectionComment.job_id == job_id)
-            .where(KeywordCollectionComment.content_id == content_id)
-            .order_by(KeywordCollectionComment.create_time.desc())
-            .limit(limit)
+            statement.order_by(*ordering)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         ).all()
-        return [_collection_comment_dict(row) for row in rows]
+        return {
+            "items": _collection_comment_payloads(session, rows),
+            "total": total, "page": page, "page_size": page_size,
+            "pages": pages, "has_prev": page > 1, "has_next": page < pages,
+            "job_id": job_id, "content_id": content_id,
+        }
 
 
 @app.post("/api/collections/{job_id}/cancel")
@@ -7123,23 +7202,58 @@ async def delete_keyword_collection(job_id: int):
 
 
 @app.get("/api/collections/{job_id}/export.xlsx")
-async def export_keyword_collection(job_id: int):
+async def export_keyword_collection(job_id: int, content_id: int | None = None,
+                                    q: str = "", ip_label: str = "",
+                                    user_sec_uid: str = "",
+                                    dedupe_users: bool = False):
     with get_session() as session:
-        job = session.get(KeywordCollectionJob, job_id)
-        if not job:
-            raise HTTPException(404, "采集任务不存在")
-        contents = session.exec(
-            select(KeywordCollectionContent)
-            .where(KeywordCollectionContent.job_id == job_id)
-            .order_by(KeywordCollectionContent.keyword,
-                      KeywordCollectionContent.create_time.desc())).all()
-        comments = session.exec(
-            select(KeywordCollectionComment)
-            .where(KeywordCollectionComment.job_id == job_id)
-            .order_by(KeywordCollectionComment.aweme_id,
-                      KeywordCollectionComment.create_time.desc())).all()
+        job, statement = _collection_comment_query(
+            session, job_id, content_id=content_id, q=q, ip_label=ip_label,
+            user_sec_uid=user_sec_uid, dedupe_users=dedupe_users)
+        comments = session.exec(statement.order_by(
+            KeywordCollectionComment.aweme_id,
+            KeywordCollectionComment.create_time.desc(),
+            KeywordCollectionComment.id.desc())).all()
+        filters = [("评论范围", "当前作品" if content_id is not None else "全部作品")]
+        if (q or "").strip():
+            filters.append(("评论关键词", (q or "").strip()))
+        if (ip_label or "").strip():
+            filters.append(("地区", (ip_label or "").strip()))
+        if (user_sec_uid or "").strip():
+            filters.append(("用户 sec_uid", (user_sec_uid or "").strip()))
+        if dedupe_users:
+            filters.append(("用户去重", "按 sec_uid 保留最新评论"))
+        all_filtered_statement = _collection_comment_query(
+            session, job_id, content_id=content_id, q=q, ip_label=ip_label,
+            user_sec_uid=user_sec_uid, dedupe_users=False)[1]
+        lead_comments = session.exec(all_filtered_statement.order_by(
+            KeywordCollectionComment.create_time.desc(),
+            KeywordCollectionComment.id.desc())).all()
+        has_filters = bool((q or "").strip() or (ip_label or "").strip()
+                           or (user_sec_uid or "").strip()
+                           or content_id is not None or dedupe_users)
+        if has_filters:
+            referenced_ids = {row.content_id for row in lead_comments}
+            if referenced_ids:
+                contents = session.exec(
+                    select(KeywordCollectionContent)
+                    .where(KeywordCollectionContent.job_id == job_id)
+                    .where(KeywordCollectionContent.id.in_(referenced_ids))
+                    .order_by(KeywordCollectionContent.keyword,
+                              KeywordCollectionContent.create_time.desc())
+                ).all()
+            else:
+                contents = []
+        else:
+            contents = session.exec(
+                select(KeywordCollectionContent)
+                .where(KeywordCollectionContent.job_id == job_id)
+                .order_by(KeywordCollectionContent.keyword,
+                          KeywordCollectionContent.create_time.desc())).all()
         from .reporting import build_keyword_collection_report
-        payload = build_keyword_collection_report(job, contents, comments)
+        payload = build_keyword_collection_report(
+            job, contents, comments, filters=filters,
+            lead_comments=lead_comments)
     return _report_download(payload, f"keyword-collection-{job_id}")
 
 
@@ -8058,6 +8172,7 @@ async def export_comments_report(
     group_name: str = "",
     tag: str = "",
     q: str = "",
+    ip_label: str = "",
     reply_type: str = "",
     min_like_count: int = 0,
     sort: str = "latest",
@@ -8071,7 +8186,7 @@ async def export_comments_report(
 
     if full:
         watch_id = aweme_id = None
-        group_name = tag = q = reply_type = ""
+        group_name = tag = q = ip_label = reply_type = ""
         min_like_count = 0
         sort = "latest"
         start = end = None
@@ -8081,6 +8196,7 @@ async def export_comments_report(
     captured_from, captured_before = _content_capture_bounds(captured_from, captured_before)
     platform = platform.strip() if platform else None
     group_name, tag, q = _meta_text(group_name, 40), _meta_text(tag, 24), q.strip()
+    ip_label = ip_label.strip()[:64]
     with get_session() as s:
         watch_stmt = select(CommentWatch)
         if platform:
@@ -8104,7 +8220,10 @@ async def export_comments_report(
             stmt = stmt.where(or_(CommentRecord.text.contains(q),
                                   CommentRecord.user_nickname.contains(q),
                                   CommentRecord.user_sec_uid.contains(q),
+                                  CommentRecord.ip_label.contains(q),
                                   CommentRecord.aweme_id.contains(q)))
+        if ip_label:
+            stmt = stmt.where(CommentRecord.ip_label.contains(ip_label))
         if reply_type == "top":
             stmt = stmt.where(CommentRecord.reply_to == "")
         elif reply_type == "reply":
@@ -8125,6 +8244,7 @@ async def export_comments_report(
             ("导出范围", "当前平台全部记录" if full else "当前筛选结果"),
             ("平台", platform), ("评论监控", watch_id), ("作品ID", aweme_id),
             ("分组", group_name), ("标签", tag), ("搜索", q),
+            ("地区", ip_label),
             ("评论类型", reply_type), ("最低点赞", min_like_count or ""),
             ("排序", sort), ("采集开始", start_date.isoformat() if start_date else ""),
             ("采集结束", end_date.isoformat() if end_date else ""),
@@ -8755,7 +8875,7 @@ def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
     return {
         "id": c.id, "watch_id": c.watch_id, "aweme_id": c.aweme_id,
         "comment_id": c.comment_id, "text": c.text, "user_nickname": c.user_nickname,
-        "user_sec_uid": c.user_sec_uid,
+        "user_sec_uid": c.user_sec_uid, "ip_label": c.ip_label,
         "like_count": c.like_count, "create_time": c.create_time,
         "is_reply": bool(c.reply_to),
         "platform": c.platform, "captured_at": _watch_captured_at(c.created_at),
@@ -8767,6 +8887,7 @@ def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
 async def list_comments(limit: int = 100, watch_id: int | None = None,
                         aweme_id: str | None = None, platform: str | None = None,
                         group_name: str = "", tag: str = "", q: str = "",
+                        ip_label: str = "",
                         reply_type: str = "", min_like_count: int = 0,
                         sort: str = "latest", page: int = 1,
                         page_size: int = 10, paginate: bool = False,
@@ -8786,11 +8907,15 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
         if aweme_id is not None:
             stmt = stmt.where(CommentRecord.aweme_id == aweme_id)
         text_query = q.strip()
+        region_query = ip_label.strip()[:64]
         if text_query:
             stmt = stmt.where(or_(CommentRecord.text.contains(text_query),
                                   CommentRecord.user_nickname.contains(text_query),
                                   CommentRecord.user_sec_uid.contains(text_query),
+                                  CommentRecord.ip_label.contains(text_query),
                                   CommentRecord.aweme_id.contains(text_query)))
+        if region_query:
+            stmt = stmt.where(CommentRecord.ip_label.contains(region_query))
         if reply_type == "top":
             stmt = stmt.where(CommentRecord.reply_to == "")
         elif reply_type == "reply":

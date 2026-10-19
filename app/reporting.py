@@ -513,7 +513,7 @@ _CONTENT_HEADERS = (
 )
 _COMMENT_HEADERS = (
     "ID", "评论监控", "平台", "作品ID", "评论ID", "评论内容", "用户昵称",
-    "用户sec_uid", "点赞数", "评论时间", "采集时间", "类型", "上级评论ID",
+    "用户sec_uid", "地区", "点赞数", "评论时间", "采集时间", "类型", "上级评论ID",
 )
 _DANMAKU_HEADERS = (
     "ID", "弹幕监控", "平台", "作品ID", "弹幕ID", "弹幕内容", "用户ID",
@@ -569,6 +569,7 @@ def _comment_row(row: Any, watch_names: dict[Any, str]) -> tuple[Any, ...]:
         _text(_value(row, "text")),
         _text(_value(row, "user_nickname")),
         _text(_value(row, "user_sec_uid")),
+        _text(_value(row, "ip_label")),
         _value(row, "like_count", 0),
         _timestamp(_value(row, "create_time")),
         _excel_datetime(_value(row, "created_at")),
@@ -732,10 +733,10 @@ def build_comments_report(
         headers=_COMMENT_HEADERS,
         rows=(_comment_row(row, watch_names) for row in comments),
         filters=filters,
-        widths=(10, 28, 12, 24, 24, 56, 22, 38, 12, 20, 20, 14, 24),
-        date_columns={10, 11},
-        number_columns={1, 9},
-        number_formats={1: "0", 9: "#,##0"},
+        widths=(10, 28, 12, 24, 24, 56, 22, 38, 16, 12, 20, 20, 14, 24),
+        date_columns={11, 12},
+        number_columns={1, 10},
+        number_formats={1: "0", 10: "#,##0"},
         tab_color="14B8A6",
         freeze_panes="F2",
         row_height=36,
@@ -868,9 +869,65 @@ def build_share_history_report(
     )
 
 
+def _collection_lead_rows(comments: Sequence[Any], content_by_id: Mapping[Any, Any]):
+    """Aggregate stable users across works without emitting empty sec_uids."""
+    leads = {}
+    for row in comments:
+        uid_raw = _value(row, "user_sec_uid")
+        uid = str(uid_raw or "").strip()
+        if not uid:
+            continue
+        content = content_by_id.get(_value(row, "content_id"))
+        entry = leads.setdefault(uid, {
+            "nickname": "", "region": "", "comments": 0,
+            "content_ids": set(), "likes": 0, "latest_key": (-1, -1),
+            "latest_time": 0, "sample": "", "keywords": [],
+        })
+        entry["comments"] += 1
+        content_id = _value(row, "content_id")
+        if content_id is not None:
+            entry["content_ids"].add(content_id)
+        try:
+            entry["likes"] += int(_value(row, "like_count", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        keyword = str(_value(content, "keyword") or "").strip()
+        if keyword and keyword not in entry["keywords"]:
+            entry["keywords"].append(keyword)
+        try:
+            timestamp = int(_value(row, "create_time", 0) or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+        try:
+            row_id = int(_value(row, "id", 0) or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        latest_key = (timestamp, row_id)
+        if latest_key >= entry["latest_key"]:
+            entry["latest_key"] = latest_key
+            entry["latest_time"] = timestamp
+            entry["nickname"] = _value(row, "user_nickname") or ""
+            entry["region"] = _value(row, "ip_label") or ""
+            entry["sample"] = _value(row, "text") or ""
+    return [
+        (
+            _text(uid), _text(entry["nickname"]), _text(entry["region"]),
+            entry["comments"], len(entry["content_ids"]), entry["likes"],
+            _timestamp(entry["latest_time"]),
+            _text("、".join(entry["keywords"])), _text(entry["sample"]),
+        )
+        for uid, entry in sorted(
+            leads.items(),
+            key=lambda item: (-item[1]["comments"], item[0]),
+        )
+    ]
+
+
 def build_keyword_collection_report(job: Any, contents: Sequence[Any],
                                     comments: Sequence[Any],
-                                    generated_at: datetime | None = None) -> bytes:
+                                    generated_at: datetime | None = None,
+                                    *, filters: Sequence[tuple[str, Any]] = (),
+                                    lead_comments: Sequence[Any] | None = None) -> bytes:
     """Build one workbook containing a collection job, content and comments."""
     generated_at = generated_at or datetime.now()
     workbook = Workbook()
@@ -893,6 +950,7 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
         source_label = "采集来源"
         source_text = source_name or source_ref or source_type
     workbook.properties.title = report_title
+    lead_comments = comments if lead_comments is None else lead_comments
     _write_module_summary(
         workbook,
         report_title=report_title,
@@ -906,6 +964,12 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
             ("任务状态", _value(job, "status")),
             ("作品数", len(contents)),
             ("评论数", len(comments)),
+            ("用户线索数", len({
+                str(_value(row, "user_sec_uid") or "").strip()
+                for row in lead_comments
+                if str(_value(row, "user_sec_uid") or "").strip()
+            })),
+            *filters,
         ),
         generated_at=generated_at,
     )
@@ -945,7 +1009,9 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
             _value(row, "id"), _text(_value(content, "keyword")),
             _text(_value(row, "platform")), _text(_value(row, "aweme_id")),
             _text(_value(row, "comment_id")), _text(_value(row, "text")),
-            _text(_value(row, "user_nickname")), _value(row, "like_count", 0),
+            _text(_value(row, "user_nickname")),
+            _text(_value(row, "user_sec_uid")), _text(_value(row, "ip_label")),
+            _value(row, "like_count", 0),
             _timestamp(_value(row, "create_time")),
             "回复" if _value(row, "reply_to") else "一级评论",
             _text(_value(row, "reply_to")),
@@ -953,11 +1019,21 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
     _write_table(
         workbook, "评论",
         ("ID", "来源", "平台", "作品ID", "评论ID", "评论内容", "用户昵称",
-         "点赞数", "评论时间", "类型", "上级评论ID"),
+         "用户sec_uid", "地区", "点赞数", "评论时间", "类型", "上级评论ID"),
         comment_rows,
-        widths=(10, 20, 12, 24, 24, 58, 22, 12, 20, 14, 24),
-        date_columns={9}, number_columns={1, 8}, tab_color="14B8A6",
+        widths=(10, 20, 12, 24, 24, 58, 22, 38, 16, 12, 20, 14, 24),
+        date_columns={11}, number_columns={1, 10}, tab_color="14B8A6",
         freeze_panes="F2", row_height=36,
+    )
+    _write_table(
+        workbook, "用户线索",
+        ("用户sec_uid", "用户昵称", "地区", "评论数", "涉及作品数",
+         "总获赞", "最近评论时间", "来源关键词", "示例评论"),
+        _collection_lead_rows(lead_comments, content_by_id),
+        widths=(38, 22, 16, 12, 14, 12, 20, 26, 58),
+        date_columns={7}, number_columns={4, 5, 6},
+        number_formats={4: "#,##0", 5: "#,##0", 6: "#,##0"},
+        tab_color="F59E0B", freeze_panes="D2", row_height=36,
     )
     output = BytesIO()
     workbook.save(output)
@@ -1232,7 +1308,7 @@ def build_monitor_report(
     _write_table(
         workbook,
         "评论数据",
-        ("ID", "评论监控", "平台", "作品ID", "评论ID", "评论内容", "用户昵称", "用户sec_uid", "点赞数", "评论时间", "采集时间", "类型", "上级评论ID"),
+        ("ID", "评论监控", "平台", "作品ID", "评论ID", "评论内容", "用户昵称", "用户sec_uid", "地区", "点赞数", "评论时间", "采集时间", "类型", "上级评论ID"),
         (
             (
                 _value(row, "id"),
@@ -1243,6 +1319,7 @@ def build_monitor_report(
                 _text(_value(row, "text")),
                 _text(_value(row, "user_nickname")),
                 _text(_value(row, "user_sec_uid")),
+                _text(_value(row, "ip_label")),
                 _value(row, "like_count", 0),
                 _timestamp(_value(row, "create_time")),
                 _excel_datetime(_value(row, "created_at")),
@@ -1251,10 +1328,10 @@ def build_monitor_report(
             )
             for row in comments
         ),
-        widths=(10, 28, 12, 24, 24, 56, 22, 38, 12, 20, 20, 14, 24),
-        date_columns={10, 11},
-        number_columns={1, 9},
-        number_formats={1: "0", 9: "#,##0"},
+        widths=(10, 28, 12, 24, 24, 56, 22, 38, 16, 12, 20, 20, 14, 24),
+        date_columns={11, 12},
+        number_columns={1, 10},
+        number_formats={1: "0", 10: "#,##0"},
         tab_color="14B8A6",
         freeze_panes="F2",
         row_height=36,

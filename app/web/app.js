@@ -955,6 +955,7 @@ function _moduleReportParams(module, full) {
     put("group_name", COMMENT_GROUP);
     put("tag", COMMENT_TAG);
     put("q", $("comment-query") && $("comment-query").value);
+    put("ip_label", $("comment-ip-label") && $("comment-ip-label").value);
     put("reply_type", $("comment-type") && $("comment-type").value);
     put("min_like_count", $("comment-min-likes") && $("comment-min-likes").value);
     put("sort", $("comment-sort") && $("comment-sort").value);
@@ -1818,6 +1819,8 @@ let BROWSER_RUNTIMES = [];
 let BROWSER_RUNTIME_ROOT = "";
 let MONITORS = [], WATCHES = [], CONTENTS = [];
 let COLLECTION_JOBS = [], COLLECTION_JOB_ID = 0, COLLECTION_PAGE = 1;
+let COLLECTION_COMMENT_CONTENT_ID = 0, COLLECTION_COMMENT_PAGE = 1;
+let COLLECTION_COMMENT_TIMER = null, COLLECTION_COMMENT_REQUEST = 0;
 let COLLECTION_FAVORITE_BOARDS = [];
 let DANMAKU_WATCHES = [];
 let CHANNELS = [], PUBLISH_TASKS = [], WEBHOOKS = [], WEBHOOK_EDIT_ID = 0;
@@ -5643,22 +5646,100 @@ async function loadCollectionContents(page = COLLECTION_PAGE, quiet = false) {
     $("collection-result-count").textContent = "";
   }
 }
-async function showCollectionComments(contentId) {
+function collectionCommentParams({ exportMode = false } = {}) {
+  const params = new URLSearchParams();
+  const scope = $("collection-comments-scope");
+  const contentId = scope ? String(scope.value || "") : String(COLLECTION_COMMENT_CONTENT_ID || "");
+  const q = $("collection-comments-q")?.value.trim() || "";
+  const region = $("collection-comments-region")?.value.trim() || "";
+  const secUid = $("collection-comments-secuid")?.value.trim() || "";
+  const dedupe = Boolean($("collection-comments-dedupe")?.checked);
+  if (contentId) params.set("content_id", contentId);
+  if (q) params.set("q", q);
+  if (region) params.set("ip_label", region);
+  if (secUid) params.set("user_sec_uid", secUid);
+  if (dedupe) params.set("dedupe_users", "true");
+  if (!exportMode) {
+    params.set("paginate", "true");
+    params.set("page", String(COLLECTION_COMMENT_PAGE));
+    params.set("page_size", "40");
+  }
+  return params;
+}
+function collectionCommentMarkup(comment) {
+  const source = [comment.source_keyword ? `#${comment.source_keyword}` : "", comment.source_desc || ""]
+    .filter(Boolean).join(" · ");
+  return `<article class="collection-comment"><div class="collection-comment-head"><div><b>${esc(comment.user_nickname || "匿名用户")}</b>${comment.ip_label ? ` · ${esc(comment.ip_label)}` : ""}${comment.user_sec_uid ? `<div class="comment-user-sec" title="${esc(comment.user_sec_uid)}">sec_uid: ${esc(comment.user_sec_uid)}</div>` : ""}${source ? `<div class="collection-comment-source">${esc(source)}</div>` : ""}</div><span>${fmtTime(comment.create_time)} · ${fmtNum(comment.like_count)} 赞${comment.reply_to ? " · 回复" : ""}</span></div><p>${esc(comment.text || "（空评论）")}</p></article>`;
+}
+async function loadCollectionComments(page = COLLECTION_COMMENT_PAGE) {
   const modal = $("collection-comments-modal");
   const list = $("collection-comments-list");
+  if (!modal || !list || !COLLECTION_JOB_ID) return;
+  COLLECTION_COMMENT_PAGE = Math.max(1, Number(page) || 1);
+  const request = ++COLLECTION_COMMENT_REQUEST;
   list.innerHTML = `<div class="empty"><div class="empty-t">加载中…</div></div>`;
-  modal.style.display = "flex"; modalOpened(modal);
-  setTimeout(() => modal.querySelector(".pv-close").focus(), 0);
   try {
-    const comments = await api(`/api/collections/${COLLECTION_JOB_ID}/comments?content_id=${contentId}&limit=500`);
-    $("collection-comments-count").textContent = `共 ${comments.length} 条本次采集评论`;
-    list.innerHTML = comments.map(comment => `<article class="collection-comment"><div class="collection-comment-head"><b>${esc(comment.user_nickname || "匿名用户")}</b><span>${fmtTime(comment.create_time)} · ${fmtNum(comment.like_count)} 赞${comment.reply_to ? " · 回复" : ""}</span></div><p>${esc(comment.text || "（空评论）")}</p></article>`).join("") || `<div class="empty"><div class="empty-t">没有已采评论</div></div>`;
+    const result = await api(`/api/collections/${COLLECTION_JOB_ID}/comments?${collectionCommentParams().toString()}`);
+    if (request !== COLLECTION_COMMENT_REQUEST || modal.style.display === "none") return;
+    const payload = Array.isArray(result)
+      ? { items: result, total: result.length, page: 1, pages: 1, has_prev: false, has_next: false }
+      : result;
+    COLLECTION_COMMENT_PAGE = Number(payload.page || 1);
+    $("collection-comments-count").textContent = `共 ${fmtNum(payload.total || 0)} 条符合条件的评论`;
+    list.innerHTML = (payload.items || []).map(collectionCommentMarkup).join("") || `<div class="empty"><div class="empty-t">没有符合条件的评论</div><div class="empty-sub">调整筛选条件后重试</div></div>`;
+    const pager = $("collection-comments-pager");
+    if (pager) {
+      pager.hidden = Number(payload.pages || 1) <= 1;
+      pager.innerHTML = `<button type="button" class="ghost sm" onclick="loadCollectionComments(${Math.max(1, Number(payload.page || 1) - 1)})"${payload.has_prev ? "" : " disabled"}>${ic("i-prev")}上一页</button><span class="mut">第 ${payload.page || 1} / ${payload.pages || 1} 页</span><button type="button" class="ghost sm" onclick="loadCollectionComments(${Number(payload.page || 1) + 1})"${payload.has_next ? "" : " disabled"}>下一页${ic("i-next")}</button>`;
+    }
   } catch (e) {
+    if (request !== COLLECTION_COMMENT_REQUEST) return;
     list.innerHTML = `<div class="empty"><div class="empty-t">加载失败</div><div class="empty-sub">${esc(e.message)}</div></div>`;
   }
 }
+function scheduleCollectionCommentFilter() {
+  const scope = $("collection-comments-scope");
+  COLLECTION_COMMENT_CONTENT_ID = Number(scope?.value || 0);
+  COLLECTION_COMMENT_PAGE = 1;
+  clearTimeout(COLLECTION_COMMENT_TIMER);
+  COLLECTION_COMMENT_TIMER = setTimeout(() => loadCollectionComments(1), 220);
+}
+function resetCollectionCommentFilters({ reload = true } = {}) {
+  ["collection-comments-q", "collection-comments-region", "collection-comments-secuid"].forEach(id => { const el = $(id); if (el) el.value = ""; });
+  const dedupe = $("collection-comments-dedupe");
+  if (dedupe) dedupe.checked = false;
+  const scope = $("collection-comments-scope");
+  if (scope) scope.value = String(COLLECTION_COMMENT_CONTENT_ID || "");
+  COLLECTION_COMMENT_PAGE = 1;
+  if (reload) loadCollectionComments(1);
+}
+async function showCollectionComments(contentId) {
+  const modal = $("collection-comments-modal");
+  const scope = $("collection-comments-scope");
+  COLLECTION_COMMENT_CONTENT_ID = Number(contentId) || 0;
+  if (scope) {
+    scope.innerHTML = `<option value="">全部作品</option><option value="${COLLECTION_COMMENT_CONTENT_ID}">当前作品 #${COLLECTION_COMMENT_CONTENT_ID}</option>`;
+    scope.value = String(COLLECTION_COMMENT_CONTENT_ID || "");
+  }
+  resetCollectionCommentFilters({ reload: false });
+  modal.style.display = "flex"; modalOpened(modal);
+  setTimeout(() => modal.querySelector(".pv-close")?.focus(), 0);
+  await loadCollectionComments(1);
+}
+async function exportFilteredCollectionComments(button) {
+  if (!COLLECTION_JOB_ID) return;
+  await withBusy(button, "导出中", async () => {
+    try {
+      const params = collectionCommentParams({ exportMode: true });
+      await _downloadExcelReport(`/api/collections/${COLLECTION_JOB_ID}/export.xlsx?${params.toString()}`, `keyword-collection-${COLLECTION_JOB_ID}-filtered.xlsx`);
+      toast("当前筛选结果已导出", "ok");
+    } catch (e) { toast("导出失败：" + e.message, "err"); }
+  });
+}
 function hideCollectionComments() {
   const modal = $("collection-comments-modal");
+  ++COLLECTION_COMMENT_REQUEST;
+  clearTimeout(COLLECTION_COMMENT_TIMER);
   modal.style.display = "none"; modalClosed(modal);
 }
 async function cancelCollection(jobId) {
@@ -6970,9 +7051,11 @@ async function refreshComments(resetPage = false) {
   if (COMMENT_GROUP) params.set("group_name", COMMENT_GROUP);
   if (COMMENT_TAG) params.set("tag", COMMENT_TAG);
   const query = (($('comment-query') && $('comment-query').value) || "").trim();
+  const ipLabel = (($('comment-ip-label') && $('comment-ip-label').value) || "").trim();
   const replyType = ($('comment-type') && $('comment-type').value) || "";
   const minLikes = +(($('comment-min-likes') && $('comment-min-likes').value) || 0);
   if (query) params.set("q", query);
+  if (ipLabel) params.set("ip_label", ipLabel);
   if (replyType) params.set("reply_type", replyType);
   if (Number.isFinite(minLikes) && minLikes > 0) params.set("min_like_count", String(Math.floor(minLikes)));
   params.set("sort", ($('comment-sort') && $('comment-sort').value) || "captured_desc");
@@ -6994,7 +7077,7 @@ async function refreshComments(resetPage = false) {
     return `<tr>
     <td class="watch-record-check"><label class="watch-record-selection" title="选择这条评论"><input type="checkbox" data-id="${r.id}" aria-label="选择这条评论" onchange="commentToggleOne(${r.id}, this.checked)" ${selComment.has(r.id) ? "checked" : ""}></label></td>
     <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}</td>
-    <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
+    <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}${r.ip_label ? ` · ${esc(r.ip_label)}` : ""}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
     <td class="mut num watch-record-likes" data-label="赞">${fmtNum(r.like_count)}</td>
     <td class="watch-record-time">${watchRecordTimeMarkup("comment", r)}</td>
     <td class="acttd watch-record-actions"><button class="ghost sm danger" onclick="delComment(${r.id})">${ic("i-trash")}删除</button></td>

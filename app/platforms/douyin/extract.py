@@ -139,6 +139,7 @@ def parse_comment(raw: dict) -> Optional[dict]:
         "user_nickname": user.get("nickname") or "",
         "user_sec_uid": str(_first_value(
             user, "sec_uid", "secUid", "sec_user_id", "secUserId", default="") or ""),
+        "ip_label": _comment_ip_label(raw, user),
         "like_count": int(raw.get("digg_count") or 0),
         "create_time": int(raw.get("create_time") or 0),
         "reply_to": str(raw.get("reply_id") or "") if raw.get("reply_id") not in (None, "0") else "",
@@ -151,6 +152,22 @@ def _first_value(d: dict, *keys, default=None):
         if value not in (None, ""):
             return value
     return default
+
+
+def _comment_ip_label(raw: dict, user: dict | None = None) -> str:
+    """Normalize region labels emitted by public, browser and creator payloads."""
+    sources = (raw, raw.get("extra") or {}, user or {})
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        value = _first_value(
+            source, "ip_label", "ipLabel", "ip_location", "ipLocation", "region",
+            default="")
+        if isinstance(value, dict):
+            value = _first_value(value, "name", "label", "text", "value", default="")
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
 
 
 def _number(value, default=0) -> float:
@@ -272,6 +289,7 @@ def parse_creator_comment(raw: dict) -> Optional[dict]:
         "user_nickname": _first(user, "nickname", "name", "user_name", default="") or "",
         "user_sec_uid": str(_first(
             user, "sec_uid", "secUid", "sec_user_id", "secUserId", default="") or ""),
+        "ip_label": _comment_ip_label(raw, user),
         "like_count": int(_first(raw, "digg_count", "like_count", "diggCount",
                                  default=0) or 0),
         "create_time": int(_first(raw, "create_time", "createTime", "comment_time",

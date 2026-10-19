@@ -75,9 +75,11 @@ async function run() {
     f.$(kind+'-captured-from').value='2026-03-08';f.$(kind+'-captured-to').value='2026-03-08';
     const bounds=JSON.parse(f.run(`JSON.stringify(contentCaptureBounds('${kind}'))`));
     assert.equal((Date.parse(bounds.captured_before)-Date.parse(bounds.captured_from))/3600000,process.env.TZ==='America/New_York'?23:24);
+    if(kind==='comment') f.$('comment-ip-label').value='北京';
     const params=new URLSearchParams(f.run(`_moduleReportParams('${module}',false).toString()`));
     assert.equal(params.get('captured_from'),bounds.captured_from);
     assert.equal(params.get('watch_id'),'0');
+    if(kind==='comment') assert.equal(params.get('ip_label'),'北京');
     assert.ok(!f.run(`_moduleReportParams('${module}',true).toString()`).includes('captured_'));
 
     const g=fixture();g.run(`${src}='11'`);

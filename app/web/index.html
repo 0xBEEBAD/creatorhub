@@ -1315,6 +1315,13 @@
   .collection-comment:last-child { border-bottom:0; }
   .collection-comment-head { display:flex; justify-content:space-between; gap:12px; margin-bottom:4px; color:var(--mut); font-size:11px; }
   .collection-comment p { margin:0; color:var(--fg); font-size:13px; line-height:1.55; overflow-wrap:anywhere; }
+  .collection-comment-filters { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:-2px 0 10px; }
+  .collection-comment-filters .field { margin-bottom:3px; }
+  .collection-comment-filter-actions { grid-column:1/-1; display:flex; flex-wrap:wrap; justify-content:flex-end; gap:7px; }
+  .collection-comment-filter-actions .spacer { flex:1 1 auto; }
+  .collection-comment-source { color:var(--mut); font-size:11px; margin-top:3px; }
+  .collection-comment-pager { display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
+  @media(max-width:600px) { .collection-comment-filters { grid-template-columns:1fr; } .collection-comment-filter-actions { grid-column:auto; justify-content:stretch; } .collection-comment-filter-actions button { flex:1 1 0; } }
   .collection-error { margin:0 0 12px; padding:10px 12px; color:var(--danger); background:color-mix(in srgb,var(--danger) 8%,var(--surface)); border:1px solid color-mix(in srgb,var(--danger) 30%,var(--line)); border-radius:var(--r-sm); font-size:12px; line-height:1.55; overflow-wrap:anywhere; }
   .collection-result-headline {
     display:flex; align-items:flex-end; justify-content:space-between; gap:16px;
@@ -3246,7 +3253,8 @@
       <p id="comment-capture-help" role="status" aria-live="polite">按当前设备时区筛选，包含结束当天；抓取时间为首次入库时间。</p>
     </div>
     <div class="manage-toolbar">
-        <input type="search" id="comment-query" placeholder="搜索评论 / 用户 / 作品 ID" aria-label="搜索评论内容" oninput="refreshComments(true)">
+        <input type="search" id="comment-query" placeholder="搜索评论 / 用户 / 地区 / 作品 ID" aria-label="搜索评论内容" oninput="refreshComments(true)">
+        <input type="search" id="comment-ip-label" placeholder="地区" aria-label="按评论地区筛选" oninput="refreshComments(true)">
         <select id="comment-group" onchange="onCommentMetaFilter()" aria-label="按分组筛选评论"><option value="">全部分组</option></select>
         <select id="comment-tag" onchange="onCommentMetaFilter()" aria-label="按标签筛选评论"><option value="">全部标签</option></select>
         <select id="comment-type" onchange="refreshComments(true)" aria-label="按评论类型筛选">
@@ -3642,8 +3650,35 @@
   <div class="rp-box" style="width:min(94vw,620px);max-height:86vh;display:flex;flex-direction:column">
     <button class="pv-close" onclick="hideCollectionComments()" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
     <h2 id="collection-comments-title">采集评论</h2>
+    <div class="collection-comment-filters">
+      <div>
+        <label class="field" for="collection-comments-scope">评论范围</label>
+        <select id="collection-comments-scope" onchange="scheduleCollectionCommentFilter()" aria-label="评论范围">
+          <option value="">全部作品</option>
+        </select>
+      </div>
+      <div>
+        <label class="field" for="collection-comments-q">评论关键词</label>
+        <input id="collection-comments-q" placeholder="搜索评论内容" oninput="scheduleCollectionCommentFilter()">
+      </div>
+      <div>
+        <label class="field" for="collection-comments-region">地区</label>
+        <input id="collection-comments-region" placeholder="如：广东" oninput="scheduleCollectionCommentFilter()">
+      </div>
+      <div>
+        <label class="field" for="collection-comments-secuid">用户 sec_uid</label>
+        <input id="collection-comments-secuid" placeholder="输入 sec_uid 片段" oninput="scheduleCollectionCommentFilter()">
+      </div>
+      <label class="switch-row" style="grid-column:1/-1"><input type="checkbox" id="collection-comments-dedupe" onchange="scheduleCollectionCommentFilter()"><span class="switch-copy"><b>按 sec_uid 去重</b><span>跨作品保留每位用户的最新评论</span></span></label>
+      <div class="collection-comment-filter-actions">
+        <span class="spacer"></span>
+        <button type="button" class="ghost sm" onclick="resetCollectionCommentFilters()"><svg><use href="#i-refresh"/></svg>重置</button>
+        <button type="button" class="ghost sm" onclick="exportFilteredCollectionComments(this)"><svg><use href="#i-download"/></svg>导出当前结果</button>
+      </div>
+    </div>
     <div class="mut" id="collection-comments-count" style="font-size:12px;margin:-6px 0 12px">—</div>
     <div id="collection-comments-list" style="overflow:auto;flex:1;min-height:140px"></div>
+    <div id="collection-comments-pager" class="collection-comment-pager" hidden></div>
   </div>
 </div>
 

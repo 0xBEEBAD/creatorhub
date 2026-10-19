@@ -692,6 +692,8 @@ class KeywordCollector:
                     aweme_id=aweme_id, comment_id=cid,
                     text=item.get("text") or "",
                     user_nickname=item.get("user_nickname") or "",
+                    user_sec_uid=item.get("user_sec_uid") or "",
+                    ip_label=item.get("ip_label") or "",
                     like_count=int(item.get("like_count") or 0),
                     create_time=int(item.get("create_time") or 0),
                     reply_to=item.get("reply_to") or "",

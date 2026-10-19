@@ -35,6 +35,8 @@ from app.main import (
     _collection_error_for_display,
     _collection_job_dict,
     _collection_keywords,
+    export_keyword_collection,
+    list_keyword_collection_comments,
     create_keyword_collection,
     keyword_collection_content_media,
     keyword_collection_local_media,
@@ -301,8 +303,10 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         }
         comments = [
             {"comment_id": "c-1", "text": "想要链接", "user_nickname": "用户甲",
+             "user_sec_uid": "MS4wLj-user-a", "ip_label": "北京",
              "like_count": 3, "create_time": 1_700_000_001, "reply_to": ""},
             {"comment_id": "c-2", "text": "已收藏", "user_nickname": "用户乙",
+             "user_sec_uid": "MS4wLj-user-b", "ip_label": "上海",
              "like_count": 1, "create_time": 1_700_000_002, "reply_to": ""},
         ]
         headed_calls = []
@@ -333,6 +337,9 @@ class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
             job = session.get(KeywordCollectionJob, self.job_id)
         self.assertEqual(len(contents), 1)
         self.assertEqual(len(saved_comments), 2)
+        saved_by_id = {row.comment_id: row for row in saved_comments}
+        self.assertEqual(saved_by_id["c-1"].user_sec_uid, "MS4wLj-user-a")
+        self.assertEqual(saved_by_id["c-1"].ip_label, "北京")
         self.assertEqual(contents[0].author_id, "author-1")
         self.assertEqual(contents[0].collected_comment_count, 2)
         self.assertEqual(job.content_count, 1)
@@ -801,6 +808,75 @@ class KeywordCollectionMediaPreviewTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 404)
 
 
+class KeywordCollectionCommentQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_engine = db._engine
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db.init_db(str(Path(self.temp_dir.name) / "collection-comments.db"))
+        with db.get_session() as session:
+            job = KeywordCollectionJob(
+                platform="douyin", account_id=1, keywords='["露营"]', status="done",
+            )
+            session.add(job); session.commit(); session.refresh(job)
+            self.job_id = job.id
+            self.contents = []
+            for keyword, aweme_id, desc in (("露营", "work-1", "海边露营"), ("骑行", "work-2", "城市骑行")):
+                content = KeywordCollectionContent(
+                    job_id=self.job_id, platform="douyin", keyword=keyword,
+                    aweme_id=aweme_id, desc=desc,
+                )
+                session.add(content); session.commit(); session.refresh(content)
+                self.contents.append(content.id)
+            comments = [
+                (self.contents[0], "u-1", "线索评论", "广东", 100),
+                (self.contents[1], "u-1", "另一条", "北京", 200),
+                (self.contents[1], "u-2", "普通评论", "广东", 150),
+                (self.contents[0], "", "无稳定 ID", "广东", 300),
+            ]
+            for content_id, uid, text, region, created in comments:
+                session.add(KeywordCollectionComment(
+                    job_id=self.job_id, content_id=content_id, platform="douyin",
+                    aweme_id="work-1" if content_id == self.contents[0] else "work-2",
+                    comment_id=f"comment-{created}", user_sec_uid=uid, text=text,
+                    ip_label=region, create_time=created,
+                ))
+            session.commit()
+
+    def tearDown(self):
+        if db._engine is not None:
+            db._engine.dispose()
+        db._engine = self.previous_engine
+        self.temp_dir.cleanup()
+
+    def test_filters_pagination_and_cross_work_user_dedupe(self):
+        filtered = asyncio.run(list_keyword_collection_comments(
+            self.job_id, q="评论", ip_label="广东", paginate=True, page_size=1))
+        self.assertEqual(filtered["total"], 2)
+        self.assertEqual(filtered["pages"], 2)
+        self.assertIn(filtered["items"][0]["source_keyword"], {"露营", "骑行"})
+
+        deduped = asyncio.run(list_keyword_collection_comments(
+            self.job_id, dedupe_users=True, paginate=True, page_size=20))
+        self.assertEqual(deduped["total"], 2)
+        self.assertEqual({row["user_sec_uid"] for row in deduped["items"]}, {"u-1", "u-2"})
+        self.assertEqual(next(row for row in deduped["items"] if row["user_sec_uid"] == "u-1")["create_time"], 200)
+
+    def test_invalid_content_scope_and_filtered_export(self):
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(list_keyword_collection_comments(self.job_id, content_id=99999))
+        self.assertEqual(caught.exception.status_code, 404)
+
+        response = asyncio.run(export_keyword_collection(self.job_id, q="线索"))
+
+        async def read_response():
+            return b"".join([chunk async for chunk in response.body_iterator])
+
+        workbook = load_workbook(BytesIO(asyncio.run(read_response())))
+        self.assertEqual(workbook["作品"].max_row, 2)
+        self.assertEqual(workbook["评论"].max_row, 2)
+        self.assertEqual(workbook["用户线索"]["A2"].value, "u-1")
+
+
 class KeywordCollectionReportTests(unittest.TestCase):
     def test_report_has_overview_content_and_comment_sheets(self):
         job = KeywordCollectionJob(
@@ -827,15 +903,21 @@ class KeywordCollectionReportTests(unittest.TestCase):
             aweme_id="note-1",
             comment_id="comment-1",
             text="+comment",
+            user_sec_uid="MS4wLj-report-user",
+            ip_label="广东",
         )
 
         workbook = load_workbook(BytesIO(
             build_keyword_collection_report(job, [content], [comment])
         ))
 
-        self.assertEqual(workbook.sheetnames, ["概览", "作品", "评论"])
+        self.assertEqual(workbook.sheetnames, ["概览", "作品", "评论", "用户线索"])
         self.assertEqual(workbook["作品"]["E2"].value, "'=FORMULA")
         self.assertEqual(workbook["评论"]["F2"].value, "'+comment")
+        self.assertEqual(workbook["评论"]["H2"].value, "MS4wLj-report-user")
+        self.assertEqual(workbook["评论"]["I2"].value, "广东")
+        self.assertEqual(workbook["用户线索"]["A2"].value, "MS4wLj-report-user")
+        self.assertEqual(workbook["用户线索"]["D2"].value, 1)
 
 
 if __name__ == "__main__":

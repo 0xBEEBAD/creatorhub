@@ -343,6 +343,7 @@ class CommentRecord(SQLModel, table=True):
     text: str = ""
     user_nickname: str = ""
     user_sec_uid: str = ""                    # 抖音评论用户 sec_uid
+    ip_label: str = ""                        # 平台返回的评论地区标签
     like_count: int = 0
     create_time: int = 0                       # 评论时间(unix 秒)
     reply_to: str = ""                         # 上级评论 cid(子评论时)
@@ -427,6 +428,8 @@ class KeywordCollectionComment(SQLModel, table=True):
     comment_id: str = Field(index=True)
     text: str = ""
     user_nickname: str = ""
+    user_sec_uid: str = ""
+    ip_label: str = ""
     like_count: int = 0
     create_time: int = 0
     reply_to: str = ""
