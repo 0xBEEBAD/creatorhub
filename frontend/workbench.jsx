@@ -64,13 +64,13 @@ for (const key of ["monitors", "comments", "danmaku"]) {
 
 // Configuration is progressively disclosed; the search/record tools stay first.
 const groupSpecs = {
-  accounts: [["accounts", "账号列表"], ["runtime", "浏览器内核"], ["proxies", "代理池"]],
+  accounts: [["accounts", "账号列表"], ["inbox", "聚合私信", ["douyin", "xhs", "kuaishou"]], ["runtime", "浏览器内核"], ["proxies", "代理池"]],
   settings: [["appearance", "外观与体验"], ["downloads", "下载设置"], ["ai", "AI 文案"], ["engine", "采集与运行"]],
   monitors: [["targets", "监控目标"], ["records", "作品记录"]],
   comments: [["targets", "监控目标"], ["records", "评论记录"]],
   danmaku: [["targets", "监控目标"], ["records", "弹幕记录"]],
   autocomment: [["rules", "评论规则"], ["tasks", "任务与审核"]],
-  publish: [["editor", "撰写内容"], ["records", "发布记录"], ["published", "已发布作品", "xhs"]],
+  publish: [["editor", "撰写内容"], ["records", "发布记录"], ["published", "已发布作品", ["xhs"]]],
   "risk-control": [["status", "账号状态"], ["rules", "风控规则"]],
 };
 const groups = Object.entries(groupSpecs).map(([key, spec]) => {
@@ -79,7 +79,11 @@ const groups = Object.entries(groupSpecs).map(([key, spec]) => {
   const target = document.createElement("div");
   target.className = "wb-section-tabs";
   panel.prepend(target);
-  const items = spec.map(([value, label, platform], i) => ({ value, label, platform, node: nodes[i] })).filter(x => x.node);
+  // Match stable section keys, not card positions: inserting a card must never
+  // put its content under another tab's label.
+  const items = spec.map(([value, label, platforms]) => ({
+    value, label, platforms, node: nodes.find(node => node.dataset.section === value),
+  })).filter(x => x.node);
   items.forEach(item => parking.append(item.node));
   // Risk counts belong with status, not above every configuration view.
   if (key === "risk-control") items[0].node.prepend(panel.querySelector(".risk-stats"));
@@ -168,7 +172,7 @@ const tabSetters = new Map();
 function SectionTabs({ group, platform }) {
   const [value, setValue] = useState(group.items[0].value);
   const root = useRef(null), list = useRef(null), previous = useRef(value);
-  const visible = group.items.filter(item => !item.platform || item.platform === platform);
+  const visible = group.items.filter(item => !item.node.hidden && (!item.platforms || item.platforms.includes(platform)));
   useLayoutEffect(() => {
     tabSetters.set(group.key, setValue);
     return () => tabSetters.delete(group.key);
@@ -183,7 +187,7 @@ function SectionTabs({ group, platform }) {
     }
   }, [value]);
   return <Tabs.Root ref={root} value={value} onValueChange={setValue} className="wb-tabs">
-    <Tabs.List ref={list} className="wb-tablist" aria-label={group.items.map(item => item.label).join("、")}>
+    <Tabs.List ref={list} className="wb-tablist" aria-label={visible.map(item => item.label).join("、")}>
       {visible.map(item => <Tabs.Trigger key={item.value} value={item.value} className="wb-tab">{item.label}</Tabs.Trigger>)}
     </Tabs.List>
     {group.items.map(item => <Tabs.Content key={item.value} value={item.value} forceMount hidden={item.value !== value} className="wb-tabpanel">

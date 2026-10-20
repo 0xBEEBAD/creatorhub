@@ -1911,7 +1911,7 @@
 
   <section data-panel="accounts">
     <!-- 登录 / 账号 -->
-    <div class="card">
+    <div class="card" data-section="accounts">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-user"/></svg></span>
         <h2>账号 <span class="sub">登录 / 管理</span></h2>
@@ -1945,7 +1945,8 @@
       <div class="table-wrap mini-table"><table id="acc-table" aria-label="平台账号列表"><tbody></tbody></table></div>
     </div>
 
-    <div class="card notsh-only">
+    <!-- 暂时隐藏聚合私信入口与内容，保留功能；移除 hidden 即可恢复。 -->
+    <div class="card notsh-only" data-section="inbox" hidden>
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-send"/></svg></span>
         <h2>聚合私信 <span class="sub">当前平台所有账号 · 人工处理</span></h2>
@@ -1955,7 +1956,7 @@
     </div>
 
     <!-- 指纹 Chromium 多版本内核 -->
-    <div class="card">
+    <div class="card" data-section="runtime">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-film"/></svg></span>
         <h2>浏览器内核 <span class="sub">多版本管理 · 账号固定绑定</span></h2>
@@ -1974,7 +1975,7 @@
     </div>
 
     <!-- 代理池(提前配置好,账号从池里关联) -->
-    <div class="card">
+    <div class="card" data-section="proxies">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-shield"/></svg></span>
         <h2>代理池 <span class="sub">提前配置 · 账号关联使用</span></h2>
@@ -2012,7 +2013,7 @@
       <div class="risk-stat"><b id="risk-stat-today">—</b><span>今日风险事件</span></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-section="status">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-shield"/></svg></span>
         <h2>账号风险态势 <span class="sub">状态、原因、恢复进度与待执行任务</span></h2>
@@ -2037,7 +2038,7 @@
       </table></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-section="rules">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-settings"/></svg></span>
         <h2>风控规则 <span class="sub">保存后立即作用于后台调度</span></h2>
@@ -2488,7 +2489,7 @@
   </section>
 
   <section data-panel="settings">
-  <div class="card appearance-card">
+  <div class="card appearance-card" data-section="appearance">
     <div class="card-head">
       <span class="card-ic"><svg aria-hidden="true"><use href="#i-sun"/></svg></span>
       <h2>外观与体验 <span class="sub">所有平台共用 · 即选即生效</span></h2>
@@ -2527,7 +2528,7 @@
     <div class="appearance-status"><svg aria-hidden="true"><use href="#i-check"/></svg><span id="appearance-status" role="status" aria-live="polite">偏好自动保存在此浏览器</span></div>
   </div>
   <!-- 下载设置 -->
-  <div class="card">
+  <div class="card" data-section="downloads">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-download"/></svg></span>
       <h2>下载设置 <span class="sub">全局默认</span></h2>
@@ -2557,7 +2558,7 @@
   </div>
 
   <!-- 大模型 API(自动评论文案)-->
-  <div class="card">
+  <div class="card" data-section="ai">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-bolt"/></svg></span>
       <h2>大模型 API <span class="sub">自动评论文案生成(OpenAI 兼容接口)</span></h2>
@@ -2606,7 +2607,7 @@
       </div>
     </div>
   </div>
-  <div class="card" id="engine-settings-card">
+  <div class="card" id="engine-settings-card" data-section="engine">
     <div class="card-head">
       <span class="card-ic"><svg aria-hidden="true"><use href="#i-settings"/></svg></span>
       <h2>采集与运行 <span class="sub">常用配置，不必编辑文件</span></h2>
@@ -2800,7 +2801,7 @@
 
   <section data-panel="publish">
     <!-- 发布到小红书 -->
-    <div class="card">
+    <div class="card" data-section="editor">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-send"/></svg></span>
         <h2 id="pub-head"><span id="pub-head-lead">发布笔记</span> <span class="sub" id="pub-head-sub">上传图集 / 视频到小红书(实验性)</span></h2>
@@ -2862,7 +2863,7 @@
     </div>
 
     <!-- 发布任务列表 -->
-    <div class="card">
+    <div class="card" data-section="records">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-list"/></svg></span>
         <h2>发布记录 / 队列</h2>
@@ -2873,7 +2874,7 @@
     </div>
 
     <!-- 已发布作品(创作平台)· 仅小红书 -->
-    <div class="card xhs-only">
+    <div class="card xhs-only" data-section="published">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-film"/></svg></span>
         <h2>已发布作品 <span class="sub">小红书创作平台</span></h2>
@@ -2937,7 +2938,7 @@
     </div>
 
     <!-- 规则列表 -->
-    <div class="card">
+    <div class="card" data-section="rules">
       <div class="card-head"><span class="card-ic"><svg><use href="#i-list"/></svg></span><h2>评论规则</h2></div>
       <div class="table-wrap"><table aria-label="自动评论规则列表"><thead><tr>
         <th>名称</th><th>模式</th><th>目标</th><th>账号</th><th>每日/间隔</th><th>上次运行</th><th>状态</th><th>操作</th>
@@ -2945,7 +2946,7 @@
     </div>
 
     <!-- 任务列表 -->
-    <div class="card">
+    <div class="card" data-section="tasks">
       <div class="card-head"><span class="card-ic"><svg><use href="#i-msg"/></svg></span><h2>评论任务 / 记录</h2>
         <select id="ac-task-filter" onchange="refreshCommentTasks()" style="margin-left:auto;max-width:160px;flex:0 0 auto" aria-label="按状态筛选评论任务">
           <option value="">全部状态</option>
@@ -3023,7 +3024,7 @@
 
   <section data-panel="monitors">
   <!-- 监控列表 -->
-  <div class="card">
+  <div class="card" data-section="targets">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-target"/></svg></span>
       <h2>监控列表 <span class="sub">运行中</span></h2>
@@ -3041,7 +3042,7 @@
   </div>
 
   <!-- 下载记录 -->
-  <div class="card">
+  <div class="card" data-section="records">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-film"/></svg></span>
       <h2 id="content-title">作品记录</h2>
@@ -3206,7 +3207,7 @@
     </div>
 
     <!-- 评论监控列表 -->
-    <div class="card">
+    <div class="card" data-section="targets">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-list"/></svg></span>
         <h2>评论监控列表</h2>
@@ -3224,7 +3225,7 @@
     </div>
 
   <!-- 评论数据 -->
-  <div class="card">
+  <div class="card" data-section="records">
     <div class="card-head">
       <span class="card-ic"><svg><use href="#i-msg"/></svg></span>
       <h2>抓到的评论</h2>
@@ -3382,7 +3383,7 @@
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" data-section="targets">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-list"/></svg></span>
         <h2>弹幕监控列表</h2>
@@ -3399,7 +3400,7 @@
       </tr></thead><tbody id="danmaku-watch-table"></tbody></table></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-section="records">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-msg"/></svg></span>
         <h2>抓到的弹幕</h2>
