@@ -102,11 +102,14 @@ header { background:var(--topbar-bg); box-shadow:none; }
 .tabbar { background:var(--surface); }
 .brand-mark { background:var(--brand-mark); box-shadow:var(--brand-shadow); flex-shrink:0; }
 .brand-sub { font-size:11px; }
-.pswitch { border-radius:12px; background:var(--surface-2); border-color:var(--line-soft); }
-.pswitch button { border-radius:8px; min-height:36px; box-shadow:none; }
-.pswitch button.active[data-pf] { background:var(--surface); color:var(--acc); border-color:var(--line); box-shadow:var(--sh-sm); }
-.navitem { min-height:44px; color:var(--mut); }
-.navitem:hover { transform:none; box-shadow:none; }
+.pswitch { border-radius:10px; background:rgba(118,118,128,.12); border:none; padding:3px; gap:2px; }
+.pswitch button { border-radius:7px; min-height:32px; font-weight:550; font-size:12.5px; border:none; color:var(--mut); box-shadow:none; transition:transform .12s cubic-bezier(.2,.8,.25,1), color .15s, background .15s, box-shadow .15s; }
+.pswitch button:hover { color:var(--fg); background:rgba(255,255,255,.2); }
+.pswitch button:active:not(:disabled) { transform:scale(.96); }
+.pswitch button.active[data-pf] { background:var(--surface); color:var(--fg-strong); font-weight:600; border:none; box-shadow:0 2px 5px rgba(0,0,0,.08), 0 1px 1px rgba(0,0,0,.04); }
+.navitem { min-height:44px; color:var(--mut); border-radius:10px; transition:transform .12s cubic-bezier(.2,.8,.25,1), background .15s, color .15s; }
+.navitem:hover { transform:none; box-shadow:none; background:var(--surface-2); color:var(--fg); }
+.navitem:active { transform:scale(.985); }
 .navitem.active { background:var(--acc-soft); border-color:transparent; box-shadow:none; }
 .navitem.active::before { box-shadow:none; }
 .navitem.active .nav-label { color:var(--acc); font-weight:650; }
@@ -125,18 +128,21 @@ header { background:var(--topbar-bg); box-shadow:none; }
 .stat-v { font-size:28px; }
 .stat-ic { background:var(--surface-2); box-shadow:none; }
 .stat-l { margin-top:8px; }
-button { font-family:inherit; background:var(--acc-solid); color:var(--on-accent); min-height:40px; box-shadow:none; line-height:1.35; }
+button { font-family:inherit; background:var(--acc-solid); color:var(--on-accent); min-height:38px; border-radius:10px; box-shadow:none; line-height:1.35; transition:transform .12s cubic-bezier(.2,.8,.25,1), background-color .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease; }
 button:hover { background:var(--acc-hover); filter:none; box-shadow:none; }
+button:active:not(:disabled) { transform:scale(.972); }
 button:not([class]):not([data-pf]):not([data-tab]) { box-shadow:none; }
-button.ghost { background:var(--surface); border-color:var(--line); box-shadow:var(--sh-sm); }
-button.sm { min-height:32px; }
+button.ghost { background:rgba(120,120,128,.08); border-color:transparent; color:var(--fg); box-shadow:none; }
+button.ghost:hover { background:rgba(120,120,128,.14); border-color:transparent; }
+button.ghost:active:not(:disabled) { transform:scale(.972); background:rgba(120,120,128,.22); }
+button.sm { min-height:30px; border-radius:8px; font-size:12px; }
 button.warning-action { background:var(--warn-soft); color:var(--warn); border-color:var(--warn); }
 button.warning-action:hover { background:var(--warn-soft); box-shadow:0 0 0 1px var(--warn); }
-button:disabled { transform:none; }
+button:disabled { transform:none !important; opacity:.44; cursor:not-allowed; }
 button.danger:hover, button.ghost.danger:hover { color:var(--danger); background:var(--danger-soft); border-color:var(--danger); }
 button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible,
 summary:focus-visible, [tabindex]:focus-visible {
-  outline:2px solid var(--acc); outline-offset:3px; box-shadow:none;
+  outline:none; box-shadow:0 0 0 3px var(--acc-ring);
 }
 input, textarea, select, .cs-trg, .dt-trg { border-color:var(--control-line); box-shadow:none; }
 input[type="checkbox"]:checked, input[type="radio"]:checked { background:var(--acc-solid); border-color:var(--acc-solid); }
@@ -215,11 +221,12 @@ button.content-action-delete.danger:hover { color:var(--danger); }
 .appearance-status { display:flex; align-items:center; gap:8px; margin-top:20px; padding:11px 14px; color:var(--mut); font-size:12px; background:var(--surface-2); border-radius:9px; }
 .appearance-status svg { width:16px; height:16px; flex-shrink:0; color:var(--success); }
 .header-actions { display:flex; gap:10px; align-items:center; margin-left:auto; }
-.theme-switch { display:flex; gap:2px; padding:3px; background:var(--surface-2); border:1px solid var(--line-soft); border-radius:11px; }
-.theme-switch button { min-width:34px; min-height:34px; padding:7px; background:transparent; color:var(--mut); border-radius:7px; box-shadow:none; }
-.theme-switch button:hover { color:var(--fg); background:var(--surface-3); }
-.theme-switch button[aria-pressed="true"] { color:var(--acc); background:var(--surface); box-shadow:var(--sh-sm); }
-.theme-switch svg { width:17px; height:17px; }
+.theme-switch { display:flex; gap:2px; padding:3px; background:rgba(118,118,128,.12); border:none; border-radius:10px; }
+.theme-switch button { min-width:32px; min-height:32px; padding:6px; background:transparent; color:var(--mut); border:none; border-radius:7px; box-shadow:none; transition:transform .12s cubic-bezier(.2,.8,.25,1), color .15s, background .15s, box-shadow .15s; }
+.theme-switch button:hover { color:var(--fg); background:rgba(255,255,255,.2); }
+.theme-switch button:active:not(:disabled) { transform:scale(.94); }
+.theme-switch button[aria-pressed="true"] { color:var(--fg-strong); background:var(--surface); box-shadow:0 2px 5px rgba(0,0,0,.08), 0 1px 1px rgba(0,0,0,.04); }
+.theme-switch svg { width:16px; height:16px; }
 button.command-trigger { min-height:40px; padding:8px 10px; font-size:12px; color:var(--mut); gap:8px; }
 kbd { font:11px/1.5 var(--sans); padding:1px 5px; border:1px solid var(--line); border-radius:4px; background:var(--surface-2); color:var(--mut); white-space:nowrap; }
 .mobile-nav-toggle, .sidebar-mobile-head, .nav-backdrop { display:none; }
