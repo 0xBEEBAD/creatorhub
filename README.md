@@ -385,8 +385,8 @@ data/
   </tr>
   <tr>
     <td align="center">
-      <a href="assets/community/wechat-group.jpg">
-        <img src="assets/community/wechat-group.jpg" alt="CreatorHub 交流群二维码" width="240">
+      <a href="assets/community/wechat-group.png">
+        <img src="assets/community/wechat-group.png" alt="CreatorHub 交流群二维码" width="240">
       </a>
     </td>
     <td align="center">
