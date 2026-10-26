@@ -9,6 +9,10 @@ import json
 import time
 import urllib.parse
 import uuid
+from copy import deepcopy
+from http.cookiejar import CookieJar
+from http.cookies import CookieError, SimpleCookie
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -17,7 +21,13 @@ from curl_cffi.requests import AsyncSession
 import re
 
 from .signing import sign_url, gen_false_ms_token, gen_real_ms_token
+from .signing.web_request import UIFID_COOKIES, sign_web_query, valid_device_id, web_query_headers
 from .auth import parse_self_profile_response
+from .detail import detail_http_error, normalize_detail_error, parse_detail_response
+from .web_session import (
+    DETAIL_ORIGINS, DETAIL_PATH, cookie_header, cookie_value,
+    observed_detail_context, read_state,
+)
 from ...netfp import impersonate_for_ua
 
 BASE = "https://www.douyin.com"
@@ -74,7 +84,8 @@ class DouyinClient:
     def __init__(self, cookie: str, user_agent: str, timeout: float = 20.0,
                  proxy: str = "", *, locale: str = "zh-CN",
                  accept_language: str = "", screen_width: int = 1536,
-                 screen_height: int = 864):
+                 screen_height: int = 864, storage_state: str = "",
+                 detail_context: dict | None = None):
         self.cookie = cookie or ""
         self.ua = user_agent
         self.timeout = timeout
@@ -87,6 +98,26 @@ class DouyinClient:
         self.impersonate = impersonate_for_ua(user_agent)  # TLS 指纹复刻,绕 JA3 风控
         self._session: AsyncSession | None = None
         self._ms_token: str | None = None
+        self._token_source = ""
+        self._storage_state = deepcopy(read_state(storage_state))
+        saved_cookies = self._storage_state.get("cookies")
+        self._cookies = ([deepcopy(c) for c in saved_cookies if isinstance(c, dict)]
+                        if isinstance(saved_cookies, list) else [
+            {"name": part.split("=", 1)[0].strip(), "value": part.split("=", 1)[1].strip(),
+             "domain": ".douyin.com", "path": "/"}
+            for part in self.cookie.split(";") if "=" in part
+        ])
+        # The caller verifies this account/session binding; additionally limit
+        # the client to supported first-party origins and non-secret fields.
+        detail_context = detail_context if isinstance(detail_context, dict) else {}
+        self.detail_context = {}
+        if (detail_context.get("origin") in DETAIL_ORIGINS
+                and detail_context.get("ua") == self.ua):
+            self.detail_context = observed_detail_context(
+                detail_context["origin"] + DETAIL_PATH + "?" + urllib.parse.urlencode(
+                    detail_context.get("params") or {}), detail_context.get("headers") or {},
+                ua=self.ua, fingerprint=str(detail_context.get("fingerprint") or ""))
+        self.last_response: dict = {}
         self._im_sequence_id = 10000
         self.last_error: str = ""
         # 只有没有拿到可判定的响应时才置 True；上层据此把任务标记为
@@ -108,14 +139,119 @@ class DouyinClient:
                 await session.close()
             self._ms_token = None
 
-    def _headers(self, referer: str = BASE + "/") -> Dict[str, str]:
-        return {
+    def _headers(self, referer: str = BASE + "/", *, url: str = BASE + "/") -> Dict[str, str]:
+        headers = {
             "User-Agent": self.ua,
             "Referer": referer,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": self.accept_language,
-            "Cookie": self.cookie,
+            "Cookie": cookie_header(self._cookies, url),
         }
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.path == DETAIL_PATH and f"{parsed.scheme}://{parsed.netloc}" in DETAIL_ORIGINS:
+            for name, value in (self.detail_context.get("headers") or {}).items():
+                for previous in list(headers):
+                    if previous.lower() == name.lower():
+                        headers.pop(previous)
+                headers[name] = value
+            headers.update(web_query_headers(parsed.query))
+        return headers
+
+    def export_storage_state(self) -> dict:
+        state = deepcopy(self._storage_state)
+        state["cookies"] = deepcopy(self._cookies)
+        state.setdefault("origins", [])
+        return state
+
+    def _api_origin(self, path: str) -> str:
+        return self.detail_context.get("origin", BASE) if path == DETAIL_PATH else BASE
+
+    def _detail_device_id(self) -> str:
+        url = self._api_origin(DETAIL_PATH) + DETAIL_PATH
+        for name in UIFID_COOKIES:
+            value = cookie_value(self._cookies, url, name)
+            if valid_device_id(value):
+                return value
+        value = (self.detail_context.get("params") or {}).get("uifid", "")
+        return value if valid_device_id(value) else ""
+
+    async def _prepare_ms_token(self, url: str) -> None:
+        if self._ms_token is not None:
+            return
+        token = cookie_value(self._cookies, url, "msToken")
+        if token:
+            self._ms_token, self._token_source = token, "account_cookie"
+            return
+        self._ms_token = await gen_real_ms_token(
+            self.ua, timeout=min(self.timeout, 10.0),
+            # Auth cookies for douyin.com must not be forwarded to the SDK's
+            # different domain. Only its own domain-scoped cookies belong here.
+            cookie=cookie_header(self._cookies, "https://mssdk.bytedance.com/web/report"),
+            proxy=self.proxy)
+        self._token_source = getattr(self._ms_token, "source", "sdk_or_fallback")
+
+    def _accept_response_cookies(self, response, url: str) -> None:
+        def key(cookie):
+            return (cookie.get("name"), str(cookie.get("domain") or "").lstrip(".").lower(),
+                    cookie.get("path") or "/")
+
+        jar = getattr(getattr(response, "cookies", None), "jar", None)
+        if isinstance(jar, CookieJar):
+            for item in jar:
+                domain = item.domain or (urllib.parse.urlsplit(url).hostname or "")
+                if item.domain_specified and not domain.startswith("."):
+                    domain = "." + domain
+                same_site = str(item.get_nonstandard_attr("SameSite", "Lax")).title()
+                value = {"name": item.name, "value": item.value or "", "domain": domain,
+                         "path": item.path or "/", "secure": item.secure,
+                         "expires": item.expires if item.expires is not None else -1,
+                         "httpOnly": item.has_nonstandard_attr("HttpOnly"),
+                         "sameSite": same_site if same_site in {"Strict", "Lax", "None"} else "Lax"}
+                self._cookies = [c for c in self._cookies if key(c) != key(value)]
+                self._cookies.append(value)
+        headers = getattr(response, "headers", {}) or {}
+        # Expired Set-Cookie entries may already have been removed from curl's
+        # response jar. Honor deletion explicitly rather than reviving the old
+        # database cookie on the next request.
+        get_list = getattr(headers, "get_list", None)
+        lines = get_list("set-cookie") if callable(get_list) else [headers.get("set-cookie", "")]
+        parsed_url = urllib.parse.urlsplit(url)
+        host = parsed_url.hostname or ""
+        for line in lines if isinstance(lines, (list, tuple)) else []:
+            if not isinstance(line, str):
+                continue
+            parsed_cookie = SimpleCookie()
+            try:
+                parsed_cookie.load(line)
+                for name, morsel in parsed_cookie.items():
+                    expired = bool(morsel["max-age"]) and int(morsel["max-age"]) <= 0
+                    if not morsel["max-age"] and morsel["expires"]:
+                        expired = parsedate_to_datetime(morsel["expires"]).timestamp() <= time.time()
+                    if not expired:
+                        continue
+                    domain = (morsel["domain"] or host).lstrip(".").lower()
+                    if not (host == domain or host.endswith("." + domain)):
+                        continue
+                    path = morsel["path"] or parsed_url.path.rpartition("/")[0] or "/"
+                    self._cookies = [c for c in self._cookies if key(c) != (name, domain, path)]
+                    if name == "msToken":
+                        self._ms_token = None
+            except (CookieError, ValueError, TypeError, OverflowError):
+                continue
+        token = headers.get("x-ms-token", "")
+        if isinstance(token, str) and token and len(token) < 4096 and not re.search(r"[\s;]", token):
+            self._ms_token, self._token_source = token, "response_header"
+            # Keep an existing browser cookie's scope and expiry; do not invent
+            # an expiry or broaden its domain when the server returns a header.
+            from .web_session import cookies_for_url
+            existing = next((c for c in cookies_for_url(self._cookies, url)
+                             if c["name"] == "msToken"), None)
+            if existing is not None:
+                existing["value"] = token
+        else:
+            refreshed = cookie_value(self._cookies, url, "msToken")
+            if refreshed and refreshed != self._ms_token:
+                self._ms_token, self._token_source = refreshed, "response_cookie"
 
     def _im_request_options(self, referer: str = BASE + "/") -> Dict[str, Any]:
         self._im_sequence_id += 1
@@ -129,27 +265,38 @@ class DouyinClient:
         }
 
     def _build_url(self, path: str, params: Dict[str, Any]) -> str:
-        q = dict(DEFAULT_PARAMS)
-        # Keep direct requests aligned with the account's persistent browser
-        # identity.  Cookie, UA/TLS, locale, viewport and proxy all come from
-        # the same account row; no mutable session is shared across accounts.
-        q.update({
-            "screen_width": str(self.screen_width),
-            "screen_height": str(self.screen_height),
-            "browser_language": self.locale,
-        })
-        # 公共参数里的 browser/engine 版本对齐本客户端 UA 的 Chrome 大版本,
-        # 否则 UA 头说一个版本、query 里 browser_version 又是写死的 130,自相矛盾易被风控识别。
-        m = re.search(r"Chrome/(\d+)", self.ua or "")
-        if m:
-            ver = f"{m.group(1)}.0.0.0"
-            q["browser_version"] = ver
-            q["engine_version"] = ver
+        if path == DETAIL_PATH and self.detail_context:
+            # A calibrated request must not retain obsolete defaults that the
+            # current first-party endpoint no longer sends.
+            q = dict(self.detail_context.get("params") or {})
+        else:
+            q = dict(DEFAULT_PARAMS)
+            # Cookie, UA, locale and viewport belong to the same account.
+            q.update({
+                "screen_width": str(self.screen_width),
+                "screen_height": str(self.screen_height),
+                "browser_language": self.locale,
+            })
+            # Keep query browser versions aligned with the account's UA.
+            m = re.search(r"Chrome/(\d+)", self.ua or "")
+            if m:
+                ver = f"{m.group(1)}.0.0.0"
+                q["browser_version"] = ver
+                q["engine_version"] = ver
         q.update({k: v for k, v in params.items() if v is not None})
         q["msToken"] = self._ms_token or gen_false_ms_token()
+        if path == DETAIL_PATH:
+            for name in ("timestamp", "x-secsdk-web-signature", "uifid", "a_bogus"):
+                q.pop(name, None)
+            visitor = cookie_value(self._cookies, self._api_origin(path) + path, "s_v_web_id")
+            if visitor:
+                q.update(verifyFp=visitor, fp=visitor)
         qs = urllib.parse.urlencode(q)
-        signed = sign_url(qs, self.ua, fp=self._abogus_fingerprint())
-        return f"{BASE}{path}?{signed}"
+        fingerprint = (self.detail_context.get("fingerprint") if path == DETAIL_PATH else "")
+        signed = sign_url(qs, self.ua, fp=fingerprint or self._abogus_fingerprint())
+        if path == DETAIL_PATH and self._detail_device_id():
+            signed = sign_web_query(signed, self._detail_device_id())
+        return f"{self._api_origin(path)}{path}?{signed}"
 
     def _abogus_fingerprint(self) -> str:
         """Build the signer fingerprint from the account's stable viewport."""
@@ -164,32 +311,57 @@ class DouyinClient:
     async def _get_json(self, path: str, params: Dict[str, Any],
                         referer: str = BASE + "/") -> Optional[dict]:
         self.last_error = ""
-        url = self._build_url(path, params)
+        self.last_response = {}
+        if path == DETAIL_PATH and not self._detail_device_id():
+            self.last_error = "api_signature:missing_uifid"
+            self.last_response = {"origin": self._api_origin(path), "path": path,
+                                  "rejection_reason": "missing_uifid", "request_sent": False}
+            return None
         owned = self._session is None
         cli = self._session or AsyncSession(impersonate=self.impersonate)
         try:
-            if self._ms_token is None:
-                # 获取真实 token 失败时 gen_real_ms_token 自身回退随机 token。
-                # 只在会话第一次请求前执行，避免每页重复访问 mssdk。
-                self._ms_token = await gen_real_ms_token(
-                    self.ua, timeout=min(self.timeout, 10.0),
-                    cookie=self.cookie, proxy=self.proxy)
-                url = self._build_url(path, params)
-            r = await cli.get(url, headers=self._headers(referer),
+            await self._prepare_ms_token(self._api_origin(path) + path)
+            url = self._build_url(path, params)
+            request_token_source = self._token_source
+            request_headers = self._headers(referer, url=url)
+            r = await cli.get(url, headers=request_headers,
                               impersonate=self.impersonate, timeout=self.timeout,
-                              proxy=self.proxy or None)
+                              proxy=self.proxy or None, allow_redirects=False)
+            self._accept_response_cookies(r, url)
+            headers = getattr(r, "headers", {}) or {}
+            self.last_response = {
+                "origin": self._api_origin(path), "path": path,
+                "http_status": r.status_code, "body_bytes": len(r.content or b""),
+                "content_type": str(headers.get("content-type", ""))[:100],
+                "token_source": request_token_source,
+                "observed_context_used": bool(path == DETAIL_PATH and self.detail_context),
+                "web_signature_attached": "x-secsdk-web-signature" in request_headers,
+                "device_header_attached": "uifid" in request_headers,
+            }
             if r.status_code != 200 or not r.content:
                 # HTTP 200 + 空 body = 被风控拒了(接口本身可能是活的:follower/list 直连
                 # 空 body,页面里发同一个请求却正常)。静默 return None 会让上层把「被拒」
                 # 和「没有数据」混为一谈 —— 那正是 raw=0 查了半天的原因。
                 self.last_error = f"http_{r.status_code}" if r.status_code != 200 else "empty_body"
+                if path == DETAIL_PATH and r.status_code != 200:
+                    self.last_error, reason = detail_http_error(r.status_code, r.content)
+                    if reason:
+                        self.last_response["rejection_reason"] = reason
                 print(f"[dy-client] {path} → HTTP {r.status_code} len={len(r.content)}"
                       f"{' (空 body:多半被风控拒,非无数据)' if r.status_code == 200 else ''}")
                 return None
             try:
-                return r.json()
+                payload = r.json()
+                if isinstance(payload, dict):
+                    code = payload.get("status_code")
+                    self.last_response["business_code"] = code if isinstance(code, int) else None
+                    self.last_response["response_keys"] = sorted(payload)[:20]
+                return payload
             except Exception:
-                self.last_error = "invalid_json"
+                body = r.content.decode("utf-8", errors="ignore") if isinstance(r.content, bytes) else ""
+                self.last_error = ("risk:verification_required:html" if re.search(
+                    r"<title[^>]*>[^<]*(?:验证码中间页|安全验证|人机验证)", body, re.I)
+                    else "invalid_json")
                 print(f"[dy-client] {path} → 非 JSON len={len(r.content)}")
                 return None
         except Exception as exc:
@@ -214,10 +386,7 @@ class DouyinClient:
         owned = self._session is None
         cli = self._session or AsyncSession(impersonate=self.impersonate)
         try:
-            if self._ms_token is None:
-                self._ms_token = await gen_real_ms_token(
-                    self.ua, timeout=min(self.timeout, 10.0),
-                    cookie=self.cookie, proxy=self.proxy)
+            await self._prepare_ms_token(BASE + path)
             url = self._build_url(path, params)
             headers = self._headers(referer)
             headers.update({
@@ -818,10 +987,13 @@ class DouyinClient:
         data = await self._get_json(
             "/aweme/v1/web/aweme/detail/",
             {"aweme_id": aweme_id},
+            referer=f"{BASE}/video/{aweme_id}",
         )
-        if data and data.get("aweme_detail"):
-            return data["aweme_detail"]
-        return None
+        if data is None:
+            self.last_error = normalize_detail_error(self.last_error or "empty_response")
+            return None
+        item, self.last_error = parse_detail_response(data, aweme_id)
+        return item
 
     # ── 评论(直连 comment/list + reply,分页拉全量;参考 CommentAll)──
     async def fetch_comments_page(self, aweme_id: str, cursor: int = 0,

@@ -61,7 +61,7 @@ class EngineConfig:
     # 小红书读取默认也走账号浏览器页面，避免扫码 Cookie 在浏览器与签名直连
     # 客户端之间切换 UA/TLS/Client-Hints。api 只保留为显式兼容模式。
     xhs_read_mode: str = "browser"           # browser | api
-    douyin_read_mode: str = "hybrid"         # hybrid | api | browser
+    douyin_read_mode: str = "hybrid"         # 默认 API 优先/浏览器回退；api=仅 API；browser=仅浏览器
     # 本账号管理中的独立读取通道。资料与粉丝已支持直连；其余三项保留
     # 独立开关，待协议完整可验证后无需再迁移配置。
     douyin_profile_mode: str = "hybrid"      # hybrid | api | browser

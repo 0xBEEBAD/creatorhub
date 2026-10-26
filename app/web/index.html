@@ -2630,9 +2630,9 @@
           <div class="form-field">
             <label for="engine-douyin_read_mode">抖音读取方式</label>
             <select id="engine-douyin_read_mode" name="douyin_read_mode" disabled aria-describedby="engine-douyin-read-help">
-              <option value="hybrid">自动选择（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option>
+              <option value="hybrid">API 优先，浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option>
             </select>
-            <p class="field-help" id="engine-douyin-read-help">影响关键词采集、作品与互动数据读取。自动选择会优先使用稳定方式，并在明确失败时回退。</p>
+            <p class="field-help" id="engine-douyin-read-help">影响关键词采集、作品与互动数据读取和通用链接下载。默认先用 API，必要时回退浏览器；通用链接下载遇登录失效或安全验证时停止。</p>
           </div>
           <div class="form-field">
             <label for="engine-monitor_initial_backfill_count">抖音新监控的历史作品数量</label>
