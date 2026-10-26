@@ -47,6 +47,7 @@ from .browser.backends import (
     parse_extra_launch_args,
 )
 from .browser.ip_fingerprint import derive_ip_fingerprint
+from .browser.douyin_auth import douyin_login_prompt_visible
 from .browser.runtime_catalog import (
     discover_chromium_runtimes,
     runtime_metadata,
@@ -807,12 +808,11 @@ async def _enrich_account_profile(account_id: int, state: str, *,
                             proxy=proxy, **douyin_client_environment(a0))
                         async with client.session_scope():
                             u = await client.fetch_self_profile()
-                            if not u and a0.sec_uid:
-                                u = await client.fetch_profile(a0.sec_uid)
                         err = client.last_error or ("" if u else "empty_response")
                     except Exception as exc:
                         err = exc
-            if not u and mode == "hybrid":
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if not u and mode == "hybrid" and not auth_failed:
                 if browser is None:
                     return _done("error", err or "browser_unavailable")
                 u, browser_err = await fetch_self_profile(browser, identity)
@@ -857,8 +857,7 @@ async def _enrich_account_profile(account_id: int, state: str, *,
             acc.status = "active"
             s.add(acc); s.commit()
             return _done("ok")
-        if (err == "logged_out" or
-                getattr(err, "category", None) == RiskCategory.AUTH.value):
+        if classify_platform_error(err)[0] == RiskCategory.AUTH:
             acc.status = "invalid"
             s.add(acc); s.commit()
             return _done("invalid", err or "logged_out")
@@ -4518,6 +4517,9 @@ async def _opened_page_login_state(page, platform: str,
                                    xhs_evidence: dict | None = None) -> str:
     """Classify the opened page without turning transient UI into auth loss."""
     current_url = str(getattr(page, "url", "") or "").lower()
+    if platform == "douyin":
+        visible = await douyin_login_prompt_visible(page)
+        return "logged_out" if visible is True else "unconfirmed"
     if platform == "xhs_creator":
         if "passport" in current_url:
             return "logged_out"
@@ -4637,11 +4639,21 @@ async def open_account_browser(
                     await old_page.goto(
                         home, wait_until="domcontentloaded", timeout=30000)
                 await foreground_page.bring_to_front()
+                reused_login_state = "unconfirmed"
+                if platform == "douyin" and not environment_check:
+                    reused_login_state = await _opened_page_login_state(old_page, platform)
+                    if reused_login_state == "logged_out":
+                        with get_session() as session:
+                            account = session.get(DouyinAccount, account_id)
+                            if account:
+                                account.status = "invalid"
+                                session.add(account)
+                                session.commit()
                 return {
                     "ok": True,
                     "reused": True,
-                    "logged_out": False,
-                    "login_state": "unconfirmed",
+                    "logged_out": reused_login_state == "logged_out",
+                    "login_state": reused_login_state,
                     "login_scope": open_scope,
                     "environment_check_only": environment_check,
                     "environment_check_opened": check_opened,

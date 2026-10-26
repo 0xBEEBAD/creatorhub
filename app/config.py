@@ -27,8 +27,8 @@ class EngineConfig:
     danmaku_max_probe_points: int = 120       # 单条视频最多探测的时间点数
     danmaku_max_records_per_scan: int = 1000  # 单轮最多入库弹幕数,0=不限
     danmaku_max_records_total: int = 0        # 每个监控最多保留记录数,0=不限
-    account_check_interval_seconds: int = 1800  # 账号体检/闲置保活轮询间隔(0=关闭)
-    idle_keepalive_hours: float = 6.0  # 闲置保活阈值:账号距上次活跃超此时长才摸一次(0=每轮都摸,退回旧行为)
+    account_check_interval_seconds: int = 1800  # 登录态独立体检间隔(0=关闭)，不受普通活跃时间影响
+    idle_keepalive_hours: float = 6.0  # 兼容历史闲置保活配置；不再用于延迟登录态体检
     # 自有账号评论模式:创作中心评论管理页(实验性,抖音改版时改这里)
     creator_comment_url: str = "https://creator.douyin.com/creator-micro/interaction/comment-management"
     # 自有账号弹幕模式:创作中心弹幕管理页(实验性,抖音改版时改这里)

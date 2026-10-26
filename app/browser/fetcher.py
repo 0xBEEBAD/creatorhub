@@ -14,6 +14,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 from .identity import Identity
 from .manager import BrowserManager
+from .douyin_auth import douyin_login_prompt_visible
+from ..platforms.douyin.auth import parse_self_profile_response
 from ..platforms.douyin.extract import danmaku_key
 
 POST_API = "aweme/v1/web/aweme/post"
@@ -28,7 +30,7 @@ SEARCH_API_MARKERS = (
 )
 # 与 login.py 的登录成功判据保持一致。资料接口改版时不能再只靠页面“登录”按钮
 # 判断登录态：按钮可能未渲染，或者被 AB 页面隐藏。
-_LOGIN_COOKIES = {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "sid_guard"}
+_LOGIN_COOKIES = {"sessionid", "sessionid_ss", "sid_tt"}
 # 重发时必须去掉的一次性签名/风控参数,让抖音的 fetch 拦截器重新签
 _SIGN_PARAMS = ("a_bogus", "X-Bogus", "x-bogus", "msToken", "_signature", "verifyFp")
 
@@ -1177,7 +1179,8 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
     新版网页可能把 /user/self 重定向到 /jingxuan，且因 user_self_cache AB
     不再发 profile/self。此时从 localStorage.user_info 取得本人 sec_uid，
     再打开 /user/<sec_uid> 触发资料请求；仍未触发时，用同页 aweme/post 中
-    sec_uid 完全匹配的 author 兜底。无作品账号至少可返回昵称、头像和 sec_uid。
+    sec_uid 完全匹配的 author 补资料。这些弱来源不作为登录有效的证据；
+    未取得 profile/self 的成功响应时返回 auth_unconfirmed。
 
     拦截时若页面正在跳转，Patchright 读 body 会失败，故再补一发页内 refetch
     （抖音自己的 fetch 拦截器会补 a_bogus 签名）。
@@ -1190,20 +1193,28 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
     post_users: List[dict] = []     # profile/self 不发时，用本人作品 author 兜底
     storage_uid = ""
     profile_user_seen = False
+    self_profile_error = ""
     error = ""
     page = await mgr.new_page(identity, block_media)
 
     def is_profile(resp):
         # 只认自己的 profile/self:profile/other 是看别人主页时发的,拦了会绑错号
-        return SELF_PROFILE_API in resp.url
+        parsed = urlsplit(resp.url)
+        host = (parsed.hostname or "").lower()
+        return ((host == "douyin.com" or host.endswith(".douyin.com"))
+                and parsed.path.rstrip("/") == "/" + SELF_PROFILE_API)
 
     async def on_response(resp):
-        nonlocal profile_user_seen
+        nonlocal profile_user_seen, self_profile_error
         url = resp.url
         if ("douyin.com" in url and ("/aweme/v1/web/" in url or "/web/api/" in url)
                 and len(api_seen) < 40):
             api_seen.append(f"{resp.status} {url.split('?')[0]}")
-        if is_profile(resp) and resp.status == 200:
+        if is_profile(resp):
+            if resp.status != 200:
+                _, self_profile_error = parse_self_profile_response(
+                    None, http_status=resp.status)
+                return
             path = url.split("?")[0]
             hit_apis.append(path)
             if url not in self_urls:
@@ -1215,7 +1226,7 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
                 if len(shapes) < 4:
                     shapes.append(f"{path} body_read_failed={e!r}")
                 return
-            u = _extract_user(data)
+            u, self_profile_error = parse_self_profile_response(data)
             if u:
                 result.update(u)
                 profile_user_seen = True
@@ -1244,7 +1255,8 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
             # 因此统一由上面的 response handler 收集。
             await page.wait_for_timeout(min(max(timeout_ms // 4, 1800), 4000))
             final_url = page.url
-            if "passport" in final_url or "/login" in final_url:
+            has_login_btn = await douyin_login_prompt_visible(page)
+            if has_login_btn is True or self_profile_error == "logged_out":
                 logged_out = True
                 break
 
@@ -1265,7 +1277,7 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
 
         # profile/self 被缓存/路由改写时，显式本人 sec_uid 路由会重新触发它。
         # 已经命中过权威资料接口则无需多跳一次。
-        if storage_uid and not profile_user_seen:
+        if not logged_out and storage_uid and not profile_user_seen:
             await page.goto(f"https://www.douyin.com/user/{storage_uid}",
                             wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(min(max(timeout_ms // 3, 2200), 5000))
@@ -1278,34 +1290,39 @@ async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
             if post_user:
                 result.update(post_user)
 
-        if not profile_user_seen and self_urls:
+        if not logged_out and not profile_user_seen and self_urls:
             # 拦到了但 body 读不到:页内重发一次(此时页面已静止,不会再丢 body)
             data = await _refetch_in_page(page, self_urls[-1])
-            u = _extract_user(data)
+            u, self_profile_error = parse_self_profile_response(data)
             if u:
                 result.update(u)
                 profile_user_seen = True
             elif isinstance(data, dict) and len(shapes) < 6:
                 shapes.append(f"refetch keys={sorted(data)[:12]}")
         # 是否能看到“登录”按钮(看到=其实没登录进去)
-        try:
-            has_login_btn = await page.get_by_text("登录", exact=True).first.is_visible(
-                timeout=1500)
-        except Exception:
-            has_login_btn = None
+        if not logged_out:
+            has_login_btn = await douyin_login_prompt_visible(page)
         try:
             cookies = await page.context.cookies("https://www.douyin.com/")
-            has_login_cookie = any(c.get("name") in _LOGIN_COOKIES for c in cookies)
+            has_login_cookie = any(c.get("name") in _LOGIN_COOKIES and c.get("value")
+                                   for c in cookies)
         except Exception:
             has_login_cookie = None
 
         # 页面上的可见登录入口是最直接的退出证据。Cookie 可能尚未过期但已被
         # 服务端撤销；localStorage/profile 缓存也可能继续返回旧账号资料。
-        if _self_profile_session_is_invalid(
+        if logged_out or self_profile_error == "logged_out" or _self_profile_session_is_invalid(
                 has_login_btn, has_login_cookie, bool(result), profile_user_seen):
             result.clear()
             logged_out = True
+        elif not profile_user_seen:
+            # Cached identity + a session-looking Cookie can survive logout.
+            # Public post authors/localStorage are useful for navigation only.
+            result.clear()
+            error = self_profile_error or "auth_unconfirmed"
     except Exception as e:
+        # Navigation failures must not return a half-collected cached profile.
+        result.clear()
         error = f"{e!r}"
     finally:
         try:

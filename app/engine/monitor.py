@@ -77,6 +77,10 @@ _WRITE_SUBMIT_PREFIX = "write_submitted:"
 
 log = logging.getLogger("creatorhub.engine")
 
+
+class _AccountCheckBusy(RuntimeError):
+    """An account became busy while a health check waited for its network slot."""
+
 # 账号时区 -> 期望出口国家(ISO2)。仅列常见,匹配不到则跳过地区校验。
 _TZ_COUNTRY = {
     "Asia/Shanghai": "CN", "Asia/Chongqing": "CN", "Asia/Urumqi": "CN",
@@ -258,7 +262,8 @@ class MonitorEngine:
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
         self._actioning: set[int] = set()           # 正在执行的写操作任务 id
         self._collection_tasks: dict[int, asyncio.Task] = {}  # 一次性关键词采集
-        self._last_acct_check = time.time()   # 上次账号体检时间
+        self._last_acct_check = 0.0   # 启动后首轮校验，不沿用历史“正常”状态
+        self._pending_account_checks: set[int] = set()
         self._geo_checked: dict = {}          # account_id -> 已校验过地区的代理(避免重复探测)
         self.risk = RiskController(cfg)
         self._last_risk_prune_day = None
@@ -402,13 +407,16 @@ class MonitorEngine:
 
     @asynccontextmanager
     async def _operation_guard(self, account_id, kind: OperationKind,
-                               fallback_key: str = "", operation_target=None):
+                               fallback_key: str = "", operation_target=None,
+                               skip_busy: bool = False):
         """Serialize by global limit, network exit, then account profile."""
         account = operation_target or self._load_account(account_id)
         key = f"acc:{account_id}" if account_id else (fallback_key or "anon")
         lock = self.browser.lock_for(key)
         async with self._active_sem:
             async with self.risk.network_guard(account):
+                if skip_busy and lock.locked():
+                    raise _AccountCheckBusy()
                 async with lock:
                     if account_id and self._load_account(account_id) is None:
                         raise AccountUnavailableError("绑定账号已删除，操作已停止")
@@ -1058,7 +1066,8 @@ class MonitorEngine:
                 s.add(a); s.commit()
 
     def _keepalive_due(self, last_active_at, *, account_id=None) -> bool:
-        """闲置判定:在 idle_keepalive_hours 之后稳定地增加错峰等待。
+        """历史闲置判定（登录态体检不再使用此条件）。
+        在 idle_keepalive_hours 之后稳定地增加错峰等待。
         idle_keepalive_hours<=0 时退回旧行为(每轮都摸)。"""
         hours = self.cfg.engine.idle_keepalive_hours
         if hours <= 0 or last_active_at is None:
@@ -1138,6 +1147,10 @@ class MonitorEngine:
 
     async def _probe_account_health(self, probe) -> dict:
         aid, platform, state, creator_state, proxy, identity = probe
+        # A user-held window owns this lock for its whole lifetime. Never let
+        # one busy account stall the scheduler and every other account's check.
+        if self.browser.lock_for(f"acc:{aid}").locked():
+            return {"ok": False, "deferred": True, "reason": "account_busy"}
         decision = self.risk.preflight(aid, OperationKind.READ_LIGHT)
         if not decision.allowed:
             return {"ok": False, "deferred": True, "reason": decision.reason,
@@ -1152,7 +1165,7 @@ class MonitorEngine:
                 session.commit()
         u, err = {}, ""
         try:
-            async with self._operation_guard(aid, OperationKind.READ_LIGHT):
+            async with self._operation_guard(aid, OperationKind.READ_LIGHT, skip_busy=True):
                 decision = self.risk.preflight(aid, OperationKind.READ_LIGHT)
                 if not decision.allowed:
                     return {"ok": False, "deferred": True,
@@ -1174,12 +1187,14 @@ class MonitorEngine:
                         return {"ok": False, "indeterminate": True,
                                 "error": "仅有创作者登录态，请在账号浏览器中确认；未启动直连探测"}
                     u, err = await fetch_xhs_self_profile(self.browser, identity)
-                elif platform == "douyin" and self.cfg.engine.douyin_read_mode in {"api", "hybrid"}:
-                    with get_session() as session:
-                        account = session.get(DouyinAccount, aid)
-                        sec_uid = account.sec_uid if account else ""
+                elif platform == "douyin":
+                    # Login health follows the account-profile transport, not
+                    # the public content-read mode. Public profiles prove only
+                    # that an account exists, never that its Cookie is valid.
+                    mode = resolve_transport(
+                        self.cfg, "douyin", "account_profile")["effective_mode"]
                     cookie = dy_cookie_from_state(state or creator_state)
-                    if cookie and sec_uid:
+                    if mode in {"api", "hybrid"} and cookie:
                         client = DouyinClient(
                             cookie, identity.ua or self.cfg.engine.user_agent,
                             timeout=self.cfg.engine.request_timeout_seconds,
@@ -1187,17 +1202,17 @@ class MonitorEngine:
                             **douyin_client_environment(identity))
                         try:
                             async with client.session_scope():
-                                profile = await client.fetch_profile(sec_uid)
+                                profile = await client.fetch_self_profile()
                             if profile:
                                 u, err = profile, ""
-                            elif self.cfg.engine.douyin_read_mode == "api":
+                            else:
                                 u, err = {}, client.last_error or "empty_response"
                         except Exception as exc:
-                            if self.cfg.engine.douyin_read_mode == "api":
-                                u, err = {}, f"api:{type(exc).__name__}"
-                    elif self.cfg.engine.douyin_read_mode == "api":
-                        u, err = {}, "no_cookie_or_sec_uid"
-                    if not u and self.cfg.engine.douyin_read_mode == "hybrid":
+                            u, err = {}, exc
+                    elif mode in {"api", "hybrid"}:
+                        u, err = {}, "no_cookie"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if mode == "browser" or (not u and mode == "hybrid" and not auth_failed):
                         u, err = await fetch_self_profile(self.browser, identity)
                 elif platform == "xhs" and creator_state:
                     chk = await creator_check(creator_state, proxy=proxy)
@@ -1230,6 +1245,8 @@ class MonitorEngine:
                     self.risk.record_success(aid, OperationKind.READ_LIGHT)
                 elif err:
                     self.risk.record_failure(aid, OperationKind.READ_LIGHT, err)
+        except _AccountCheckBusy:
+            return {"ok": False, "deferred": True, "reason": "account_busy"}
         except Exception as exc:
             self.risk.record_failure(aid, OperationKind.READ_LIGHT, exc)
             return {"ok": False, "error": str(exc)}
@@ -1265,7 +1282,7 @@ class MonitorEngine:
                     account.follower_count = parsed.get("follower_count") or account.follower_count
                     account.aweme_count = parsed.get("aweme_count") or account.aweme_count
                 got_profile = True
-            elif err == "logged_out":
+            elif classify_platform_error(err)[0] == RiskCategory.AUTH:
                 account.status = "invalid"
                 log.warning("账号 %s(%s)登录态失效", aid, account.nickname)
             session.add(account)
@@ -1316,17 +1333,32 @@ class MonitorEngine:
 
     async def _check_accounts(self):
         interval = self.cfg.engine.account_check_interval_seconds
-        if interval <= 0 or time.time() - self._last_acct_check < interval:
+        if interval <= 0:
             return
-        self._last_acct_check = time.time()
+        now = time.time()
+        sweep_due = now - self._last_acct_check >= interval
+        if not sweep_due and not self._pending_account_checks:
+            return
         with get_session() as session:
+            # last_active_at includes public reads. It is not an auth check
+            # timestamp; idle_keepalive_hours must not postpone login checks.
             probes = [self._account_probe_tuple(account)
                       for account in session.exec(select(DouyinAccount)).all()
                       if (account.storage_state or account.creator_storage_state)
-                      and account.status != "invalid"
-                      and self._keepalive_due(account.last_active_at, account_id=account.id)]
+                      and account.status != "invalid"]
+        eligible = {probe[0] for probe in probes}
+        self._pending_account_checks.intersection_update(eligible)
+        if sweep_due:
+            self._last_acct_check = now
+            self._pending_account_checks.update(eligible)
         for probe in probes:
-            await self._probe_account_health(probe)
+            if probe[0] not in self._pending_account_checks:
+                continue
+            result = await self._probe_account_health(probe)
+            # Busy/risk-deferred checks stay due for the next scheduler tick;
+            # don't postpone them for another entire 30-minute interval.
+            if not result.get("deferred"):
+                self._pending_account_checks.discard(probe[0])
 
     # ── 本账号作品健康监控(B5)+ 数据快照(B4)──
     async def _check_work_health(self):

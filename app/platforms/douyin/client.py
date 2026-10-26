@@ -17,6 +17,7 @@ from curl_cffi.requests import AsyncSession
 import re
 
 from .signing import sign_url, gen_false_ms_token, gen_real_ms_token
+from .auth import parse_self_profile_response
 from ...netfp import impersonate_for_ua
 
 BASE = "https://www.douyin.com"
@@ -666,13 +667,12 @@ class DouyinClient:
         """读取当前 Cookie 对应账号，不依赖已知 sec_uid。"""
         data = await self._get_json(
             "/aweme/v1/web/user/profile/self/", {}, referer=f"{BASE}/user/self")
-        if data and data.get("user"):
-            return data["user"]
-        if data and data.get("status_code") not in (None, 0):
-            self.last_error = f"status_{data.get('status_code')}"
-        elif data is not None and not self.last_error:
-            self.last_error = "missing_user"
-        return None
+        if data is None:
+            if self.last_error == "http_401":
+                self.last_error = "logged_out"
+            return None
+        profile, self.last_error = parse_self_profile_response(data)
+        return profile
 
     async def fetch_profile(self, sec_uid: str) -> Optional[dict]:
         data = await self._get_json(

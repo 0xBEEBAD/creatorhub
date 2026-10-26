@@ -26,7 +26,7 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
      "setting": "douyin_read_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "following_list", "label": "关注列表同步",
      "setting": "douyin_read_mode", "api": True, "browser": True},
-    {"platform": "douyin", "operation": "account_profile", "label": "手动刷新账号资料",
+    {"platform": "douyin", "operation": "account_profile", "label": "账号资料/登录态体检",
      "setting": "douyin_profile_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "followers_list", "label": "粉丝列表同步",
      "setting": "douyin_followers_mode", "api": True, "browser": True,
