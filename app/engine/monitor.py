@@ -28,7 +28,8 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_channels_works, fetch_channels_comments,
                        fetch_channels_self_profile, post_channels_comment,
                        fetch_account_works, fetch_douyin_account_works_api,
-                       do_follow, send_dm, send_dm_api)
+                       do_follow, send_dm, send_dm_api,
+                       douyin_secure_post_api)
 from . import compose
 from ..config import Config
 from ..account_lifecycle import AccountUnavailableError
@@ -981,13 +982,37 @@ class MonitorEngine:
                 status = job.status
                 job_error = job.error or ""
                 log_job = job
-            category, _ = classify_platform_error(job_error)
+            category, signal = classify_platform_error(job_error)
             if job_error and category in {
                     RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
                 # 即使已经采到部分结果，验证码/登录态/网络异常也属于本次读取失败；
                 # 不能再记 success，否则会立即放行下一次重读并覆盖风险信号。
-                self.risk.record_failure(
+                failure = self.risk.record_failure(
                     account_id, OperationKind.READ_HEAVY, job_error)
+                if category == RiskCategory.RISK:
+                    with get_session() as s:
+                        deferred_job = s.get(KeywordCollectionJob, job_id)
+                        if deferred_job and deferred_job.status not in {"canceled", "done"}:
+                            deferred_job.status = "pending"
+                            deferred_job.current_step = "API 风控冷却，等待重试"
+                            deferred_job.blocked_reason = job_error
+                            deferred_job.blocked_signal = signal
+                            deferred_job.blocked_operation = OperationKind.READ_HEAVY.value
+                            deferred_job.blocked_at = datetime.utcnow()
+                            deferred_job.next_allowed_at = failure.next_allowed_at
+                            deferred_job.finished_at = None
+                            s.add(deferred_job); s.commit()
+                            self._log_collection_operation(
+                                deferred_job, "deferred", "pending", job_error,
+                                risk_signal=signal,
+                                duration_ms=int((time.monotonic() - started_clock) * 1000))
+                    return {
+                        "ok": True, "deferred": True, "status": "pending",
+                        "reason": job_error, "signal": signal,
+                        "next_allowed_at": (failure.next_allowed_at.isoformat()
+                                            if failure.next_allowed_at else None),
+                        **result,
+                    }
             elif status in {"done", "partial"}:
                 self.risk.record_success(account_id, OperationKind.READ_HEAVY)
                 self._stamp_active(account_id)
@@ -4536,13 +4561,39 @@ class MonitorEngine:
                             ok, err = await _send_new_or_existing_dm(client)
                         else:
                             ok, err = False, f"未知动作 {action}"
+                if (not ok and dy_write_mode == "hybrid"
+                        and action in {"follow", "unfollow"}
+                        and str(err or "").startswith(
+                            "api_requires_browser_security:")):
+                    secure_data, secure_error, secure_uncertain = (
+                        await douyin_secure_post_api(
+                            self.browser, identity,
+                            "/aweme/v1/web/commit/follow/user/",
+                            {"device_platform": "webapp", "aid": "6383",
+                             "channel": "channel_pc_web"},
+                            {"user_id": target_uid,
+                             "type": 2 if action == "unfollow" else 1},
+                            timeout_ms=(
+                                self.cfg.engine.request_timeout_seconds * 1000)))
+                    method = "api_browser_context"
+                    if secure_uncertain:
+                        ok, err = False, secure_error
+                    elif secure_data is None:
+                        ok, err = False, secure_error
+                    else:
+                        client.last_response = {
+                            "browser_security_context_required": True,
+                            "dtrait_header_attached": True,
+                        }
+                        ok, err = client._write_result(
+                            secure_data, secure_error or "secure_api_no_response")
                 # A known rejection has a response and can fall back; an
                 # ambiguous request is deliberately not submitted twice.
                 if (not ok and dy_write_mode == "hybrid"
                         and not str(err or "").startswith((
                             "write_uncertain:", "target_resolution_failed:"))):
                     category, _signal = classify_platform_error(err)
-                    if category == RiskCategory.BUSINESS:
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
                         ok, err, method = await _browser_action()
                         method = ("browser_fallback"
                                   if method == "browser" else method)
@@ -4766,18 +4817,53 @@ class MonitorEngine:
                     async with client.session_scope():
                         ok, result, err = await client.post_comment(
                             aweme_id, content, reply_comment_id=target_cid)
+                if (not ok and dy_write_mode == "hybrid"
+                        and str(err or "").startswith(
+                            "api_requires_browser_security:")):
+                    secure_data, secure_error, secure_uncertain = (
+                        await douyin_secure_post_api(
+                            self.browser, identity,
+                            "/aweme/v1/web/comment/publish/",
+                            {"device_platform": "webapp", "aid": "6383",
+                             "channel": "channel_pc_web",
+                             "aweme_id": aweme_id, "item_type": 0},
+                            {"aweme_id": aweme_id, "text": content,
+                             "item_type": 0, "reply_id": target_cid,
+                             "reply_comment_id": target_cid,
+                             "at_users": "[]"},
+                            timeout_ms=(
+                                self.cfg.engine.request_timeout_seconds * 1000)))
+                    method = "api_browser_context"
+                    if secure_uncertain:
+                        ok, result, err = False, "", secure_error
+                    elif secure_data is None:
+                        ok, result, err = False, "", secure_error
+                    else:
+                        client.last_response = {
+                            "browser_security_context_required": True,
+                            "dtrait_header_attached": True,
+                        }
+                        ok, err = client._write_result(
+                            secure_data, secure_error or "secure_api_no_response")
+                        comment = secure_data.get("comment") or {}
+                        result = (str(comment.get("cid")
+                                      or comment.get("comment_id")
+                                      or secure_data.get("comment_id") or "ok")
+                                  if ok else "")
                 # Only a response that clearly rejected the POST may enter the
                 # browser fallback. Unknown request outcome remains uncertain.
                 if (not ok and dy_write_mode == "hybrid"
                         and not str(err or "").startswith("write_uncertain:")):
-                    ok, err = await post_comment_browser(
-                        self.browser, identity, aweme_id, content,
-                        reply_to_text=target_text if target_cid else "",
-                        require_reply=bool(target_cid),
-                        headed=(True if native_mode
-                                else self.cfg.engine.comment_browser_headed))
-                    method = "browser_fallback"
-                    result = "ok" if ok else ""
+                    category, _signal = classify_platform_error(err)
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                        ok, err = await post_comment_browser(
+                            self.browser, identity, aweme_id, content,
+                            reply_to_text=target_text if target_cid else "",
+                            require_reply=bool(target_cid),
+                            headed=(True if native_mode
+                                    else self.cfg.engine.comment_browser_headed))
+                        method = "browser_fallback"
+                        result = "ok" if ok else ""
             else:
                 method = "browser"
                 ok, err = await post_comment_browser(

@@ -11,6 +11,32 @@ _WEB_REQUEST_SALT = "A96D855A08C0A9707F8BEF0D9A527E4E"
 _SIGNATURE = "x-secsdk-web-signature"
 UIFID_COOKIES = ("uifid", "uifid_temp", "uifidtemp", "UIFID", "UIFID_TEMP", "UIFIDTEMP")
 
+# Paths in Douyin's first-party webSign protectedHost registry. These requests
+# need both a_bogus and the UIFID-bound x-secsdk-web-signature.
+DOUYIN_WEB_SIGNED_PATHS = frozenset({
+    "/aweme/v1/web/aweme/detail/",
+    "/aweme/v1/web/aweme/post/",
+    "/aweme/v1/web/aweme/favorite/",
+    "/aweme/v1/web/aweme/listcollection/",
+    "/aweme/v1/web/mix/aweme/",
+    "/aweme/v1/web/tab/feed/",
+    "/aweme/v1/web/mix/list/",
+    "/aweme/v1/web/music/aweme/",
+    "/aweme/v1/web/music/list/",
+    "/aweme/v1/web/mix/detail/",
+    "/aweme/v1/web/mix/listcollection/",
+    "/aweme/v1/web/music/detail/",
+    "/aweme/v1/web/collects/list/",
+    "/aweme/v1/web/collects/video/list/",
+})
+
+
+def requires_web_signature(path: str) -> bool:
+    normalized = "/" + str(path or "").lstrip("/")
+    if not normalized.endswith("/"):
+        normalized += "/"
+    return normalized in DOUYIN_WEB_SIGNED_PATHS
+
 
 def valid_device_id(value: str) -> bool:
     return isinstance(value, str) and bool(value) and len(value) <= 4096 and not re.search(r"[\s;\x00-\x1f\x7f]", value)

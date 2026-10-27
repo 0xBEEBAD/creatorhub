@@ -4,6 +4,19 @@
 
 ## [0.2.4]
 
+### 抖音网页签名兼容
+
+- 将 UIFID 绑定的 `x-secsdk-web-signature` 从作品详情扩展到抖音 Web SDK 标记的 14 条受保护 GET 路径，修复作品列表 `/aweme/v1/web/aweme/post/` 返回 HTTP 403 `Uifid Not Found`。
+- 评论、关注等网页表单 POST 现在用与实际发送完全一致的 `application/x-www-form-urlencoded` 请求体计算 `a_bogus`，避免请求体摘要仍按空 body 签名。
+- 关键词搜索优先使用 `/aweme/v1/web/general/search/single/`，按分页链传递 `search_id`，结构不兼容时保留 `search/stream` 解析兼容。
+- 抖音写请求继续 API 优先，并补齐 Cookie 可确定的 UIFID、CSRF 与 Ticket Guard 客户端头；若仍因官网动态 DTrait 上下文被 403 拒绝，会明确诊断后由 hybrid 使用已登录浏览器回退。
+- POST 诊断现在记录 HTTP 状态、响应大小、内容类型、业务码、body 签名绑定和各安全头附着状态，不再沿用上一次 GET 的结果。
+- 受保护路径缺少有效 UIFID 时会在发请求前返回明确的签名错误；搜索安全验证、空响应和业务拒绝继续与签名失效分开报告。
+- 关键词采集保持 hybrid/API 优先；普通接口兼容失败仍可回退浏览器，但 `verification_required`、登录态或网络风险会进入持久化冷却，不再启动浏览器或反复拖滑块。
+- 搜索请求优先复用账号 LocalStorage 的真实 `xmst`，并以账号身份视口为准，不再被陈旧的 `dy_swidth/dy_sheight` Cookie 覆盖。
+- 移除 `ddddocr` 自动滑块识别；浏览器模式出现真实验证时只等待人工完成，API 业务层 `verify_check` 继续直接进入冷却。
+- 搜索业务码 `2483` 现在明确归类为登录态失效，不再误报为正常空结果。
+
 ### 统一采集与小红书收藏夹
 
 - 采集任务统一支持关键词、创作者主页、小红书全部收藏和指定收藏夹。

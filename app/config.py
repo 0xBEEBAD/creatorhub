@@ -34,7 +34,7 @@ class EngineConfig:
     # 自有账号弹幕模式:创作中心弹幕管理页(实验性,抖音改版时改这里)
     creator_danmaku_url: str = "https://creator.douyin.com/creator-micro/interaction/danmaku-management"
     request_timeout_seconds: int = 20
-    douyin_captcha_wait_seconds: int = 300  # 关键词采集遇验证时被动等待人工处理；期间不重试接口
+    douyin_captcha_wait_seconds: int = 300  # 浏览器模式遇验证时等待人工处理；API 风控直接冷却
     douyin_keyword_gap_seconds: float = 8.0  # 同一任务内相邻抖音关键词的最小停顿
     download_timeout_seconds: int = 120
     media_dir: str = "./data/media"
@@ -71,7 +71,7 @@ class EngineConfig:
     douyin_publish_mode: str = "browser"     # browser (api reserved)
     # browser=页面写入；api=仅网页 HTTP/imapi；hybrid=API 优先、明确拒绝时页面回退。
     # 不确定的网络结果一律不回退，避免重复提交非幂等写请求。
-    douyin_write_mode: str = "browser"       # browser | api | hybrid
+    douyin_write_mode: str = "hybrid"        # 默认 API 优先；明确失败后才回退浏览器
     xhs_keyword_gap_seconds: float = 10.0    # 同一任务相邻关键词的最小停顿
     xhs_item_gap_seconds: float = 2.5         # 相邻详情/评论读取的最小停顿
     xhs_request_jitter: float = 0.35          # 上述停顿的正向随机抖动比例
@@ -212,7 +212,7 @@ def load_config(path: str | None = None) -> Config:
                 ("douyin_dm_sync_mode", "hybrid"),
                 ("douyin_creator_danmaku_mode", "hybrid"),
                 ("douyin_publish_mode", "browser"),
-                ("douyin_write_mode", "browser")):
+                ("douyin_write_mode", "hybrid")):
             mode = str(getattr(cfg.engine, name, default) or default).strip().lower()
             setattr(cfg.engine, name, mode if mode in {"hybrid", "api", "browser"}
                     else default)

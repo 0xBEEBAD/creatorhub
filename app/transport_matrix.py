@@ -17,7 +17,9 @@ from typing import Any, Iterable
 TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
     # Douyin reads controlled by douyin_read_mode.
     {"platform": "douyin", "operation": "keyword_collection", "label": "关键词采集",
-     "setting": "douyin_read_mode", "api": True, "browser": True},
+     "setting": "douyin_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "note": "Hybrid 先直连 search/single API；普通兼容性失败可回退浏览器，verification_required/风控时进入冷却且不打开浏览器"},
     {"platform": "douyin", "operation": "public_monitor", "label": "公开作品/评论/弹幕监控",
      "setting": "douyin_read_mode", "api": True, "browser": True},
     {"platform": "douyin", "operation": "account_works", "label": "本账号作品同步",
@@ -43,11 +45,14 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
      "note": "API 按本账号作品 ID 读取弹幕；浏览器模式保留创作中心流程"},
     # Douyin writes controlled by douyin_write_mode.
     {"platform": "douyin", "operation": "comment_write", "label": "评论/回复发送",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "follow_write", "label": "关注/取关",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "dm_send", "label": "已有会话私信发送",
-     "setting": "douyin_write_mode", "api": True, "browser": True},
+     "setting": "douyin_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first"},
     {"platform": "douyin", "operation": "publish", "label": "发布作品",
      "setting": "douyin_publish_mode", "api": False, "browser": True,
      "note": "上传鉴权和提交签名仍依赖创作中心页面"},
@@ -229,7 +234,7 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "douyin_creator_danmaku_mode": _setting_value(
                 cfg, "douyin_creator_danmaku_mode", "hybrid"),
             "douyin_publish_mode": _setting_value(cfg, "douyin_publish_mode", "browser"),
-            "douyin_write_mode": _setting_value(cfg, "douyin_write_mode", "browser"),
+            "douyin_write_mode": _setting_value(cfg, "douyin_write_mode", "hybrid"),
             "xhs_read_mode": _setting_value(cfg, "xhs_read_mode", "browser"),
             "xhs_publish_mode": _setting_value(cfg, "xhs_publish_mode", "browser"),
             "xhs_comment_write_mode": _setting_value(

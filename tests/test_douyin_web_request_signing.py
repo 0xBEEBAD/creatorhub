@@ -12,7 +12,10 @@ from app.platforms.douyin import client as client_module
 from app.platforms.douyin.client import DouyinClient
 from app.platforms.douyin.detail import detail_http_error
 from app.platforms.douyin.signing import mstoken
-from app.platforms.douyin.signing.web_request import sign_web_query, web_query_headers
+from app.platforms.douyin.signing.web_request import (
+    DOUYIN_WEB_SIGNED_PATHS, requires_web_signature, sign_web_query,
+    web_query_headers,
+)
 from app.platforms.douyin.web_session import DETAIL_PATH, observed_detail_context
 from app.risk import RiskCategory, classify_platform_error
 
@@ -94,8 +97,33 @@ def test_direct_detail_sends_native_seal_and_matching_device_without_browser(mon
         assert secret not in diagnostic
 
 
+def test_direct_post_list_uses_the_same_uifid_web_signature(monkeypatch):
+    payload = {"status_code": 0, "aweme_list": [{"aweme_id": WORK}],
+               "has_more": 0, "max_cursor": 0}
+    http = http_fixture(monkeypatch, data=payload)
+    monkeypatch.setattr(client_module, "gen_real_ms_token",
+                        AsyncMock(side_effect=AssertionError("account token must be reused")))
+    client = DouyinClient("", UA, storage_state=json.dumps(account_state()))
+    page = asyncio.run(client.fetch_video_list("SEC_UID", 0, 5))
+    assert [row["aweme_id"] for row in page["items"]] == [WORK]
+    call = http.get.await_args
+    query = parse_qs(urlsplit(call.args[0]).query)
+    assert urlsplit(call.args[0]).path == "/aweme/v1/web/aweme/post/"
+    assert query["uifid"] == [call.kwargs["headers"]["uifid"]] == ["DEVICE_ONE"]
+    assert query["x-secsdk-web-signature"] == [call.kwargs["headers"]["x-secsdk-web-signature"]]
+    assert client.last_response["web_signature_attached"]
+
+
+def test_first_party_protected_path_registry_matches_current_web_sdk_scope():
+    assert requires_web_signature("/aweme/v1/web/aweme/detail")
+    assert requires_web_signature("/aweme/v1/web/aweme/post/")
+    assert not requires_web_signature("/aweme/v1/web/comment/list/")
+    assert len(DOUYIN_WEB_SIGNED_PATHS) == 14
+
+
+@pytest.mark.parametrize("path", [DETAIL_PATH, "/aweme/v1/web/aweme/post/"])
 @pytest.mark.parametrize("invalid", ["missing", "expired", "foreign_domain", "wrong_path", "header_injection"])
-def test_invalid_or_missing_scoped_uifid_stops_before_http_and_sdk(monkeypatch, invalid):
+def test_invalid_or_missing_scoped_uifid_stops_before_http_and_sdk(monkeypatch, invalid, path):
     state = account_state()
     if invalid == "missing": state["cookies"].pop(0)
     elif invalid == "expired": state["cookies"][0]["expires"] = 1
@@ -106,7 +134,10 @@ def test_invalid_or_missing_scoped_uifid_stops_before_http_and_sdk(monkeypatch, 
     sdk = AsyncMock()
     monkeypatch.setattr(client_module, "gen_real_ms_token", sdk)
     client = DouyinClient("", UA, storage_state=json.dumps(state))
-    assert asyncio.run(client.fetch_video_detail(WORK)) is None
+    if path == DETAIL_PATH:
+        assert asyncio.run(client.fetch_video_detail(WORK)) is None
+    else:
+        assert asyncio.run(client.fetch_video_list("SEC_UID"))["items"] == []
     assert client.last_error == "api_signature:missing_uifid"
     assert client.last_response["request_sent"] is False
     http.get.assert_not_awaited()

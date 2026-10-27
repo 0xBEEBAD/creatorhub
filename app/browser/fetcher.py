@@ -24,6 +24,7 @@ SELF_PROFILE_API = "aweme/v1/web/user/profile/self"
 COMMENT_API = "aweme/v1/web/comment/list"
 DANMAKU_API = "aweme/v1/web/danmaku"
 SEARCH_API_MARKERS = (
+    "/aweme/v1/web/general/search/stream/",
     "/aweme/v1/web/general/search/single/",
     "/aweme/v1/web/search/item/",
     "/aweme/v1/web/search/feed/",
@@ -122,6 +123,53 @@ def extract_search_awemes(payload) -> List[dict]:
 
     visit(payload)
     return list(found.values())
+
+
+def decode_douyin_search_payloads(raw: bytes | str) -> List[dict]:
+    """Decode normal JSON or Douyin's current chunk-framed search stream.
+
+    The first search page now uses ``general/search/stream`` and exposes the
+    HTTP chunk framing to browser response consumers: ``<hex>\r\n<json>``
+    repeated until a zero chunk.  Treat each JSON chunk as an independent
+    search payload; acknowledgement chunks simply contribute no works.
+    """
+    data = raw.encode() if isinstance(raw, str) else bytes(raw or b"")
+    if not data:
+        return []
+    try:
+        payload = json.loads(data)
+        return [payload] if isinstance(payload, dict) else []
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+
+    out: List[dict] = []
+    position = 0
+    while position < len(data):
+        line_end = data.find(b"\r\n", position)
+        if line_end < 0:
+            return []
+        size_text = data[position:line_end].split(b";", 1)[0].strip()
+        try:
+            size = int(size_text, 16)
+        except ValueError:
+            return []
+        position = line_end + 2
+        if size == 0:
+            break
+        chunk_end = position + size
+        if chunk_end > len(data):
+            return []
+        try:
+            payload = json.loads(data[position:chunk_end])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        if isinstance(payload, dict):
+            out.append(payload)
+        position = chunk_end
+        if data[position:position + 2] != b"\r\n":
+            return []
+        position += 2
+    return out
 
 
 def douyin_search_empty_error(page_title: str, page_text: str,
@@ -392,18 +440,22 @@ async def fetch_douyin_search(mgr: BrowserManager, identity: Identity, keyword: 
         if len(api_seen) < 40:
             api_seen.append(f"{resp.status} {url.split('?')[0]}")
         try:
-            payload = await resp.json()
+            payloads = [await resp.json()]
         except Exception:
-            return
-        if _douyin_search_needs_verification(payload):
-            verification_active = True
-            verification_seen = True
-            return
-        if collect_payload(payload):
-            verification_active = False
+            try:
+                payloads = decode_douyin_search_payloads(await resp.body())
+            except Exception:
+                return
+        for payload in payloads:
+            if _douyin_search_needs_verification(payload):
+                verification_active = True
+                verification_seen = True
+                continue
+            if collect_payload(payload):
+                verification_active = False
 
     async def wait_for_verification() -> bool:
-        """被动等待用户完成验证；等待期间不产生搜索请求。"""
+        """Bring the browser forward and wait for manual verification."""
         if not verification_active:
             return True
         try:

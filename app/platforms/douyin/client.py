@@ -21,7 +21,10 @@ from curl_cffi.requests import AsyncSession
 import re
 
 from .signing import sign_url, gen_false_ms_token, gen_real_ms_token
-from .signing.web_request import UIFID_COOKIES, sign_web_query, valid_device_id, web_query_headers
+from .signing.web_request import (
+    UIFID_COOKIES, requires_web_signature, sign_web_query, valid_device_id,
+    web_query_headers,
+)
 from .auth import parse_self_profile_response
 from .detail import detail_http_error, normalize_detail_error, parse_detail_response
 from .web_session import (
@@ -31,10 +34,21 @@ from .web_session import (
 from ...netfp import impersonate_for_ua
 
 BASE = "https://www.douyin.com"
+WRITE_BASE = "https://www-hj.douyin.com"
 IMAPI_SEND_URL = "https://imapi.douyin.com/v1/message/send"
 IMAPI_CREATE_URL = "https://imapi.douyin.com/v2/conversation/create"
 FOLLOW_MAX_PAGES = 10_000
 FOLLOW_PAGE_DELAY_SECONDS = 0.15
+SECURE_SDK_WRITE_PATHS = frozenset({
+    "/aweme/v1/web/commit/item/digg/",
+    "/aweme/v1/web/commit/follow/user/",
+    "/aweme/v1/web/comment/publish/",
+    "/aweme/v1/web/commit/user/",
+    "/aweme/v1/web/danmaku/post_v2/",
+})
+SEARCH_STREAM_PATH = "/aweme/v1/web/general/search/stream/"
+SEARCH_SINGLE_PATH = "/aweme/v1/web/general/search/single/"
+SEARCH_PATHS = frozenset({SEARCH_SINGLE_PATH, SEARCH_STREAM_PATH})
 
 
 def cookie_from_state(storage_state_json: str) -> str:
@@ -76,7 +90,7 @@ DEFAULT_PARAMS = {
     "platform": "PC",
     "downlink": "10",
     "effective_type": "4g",
-    "round_trip_time": "50",
+    "round_trip_time": "150",
 }
 
 
@@ -99,6 +113,7 @@ class DouyinClient:
         self._session: AsyncSession | None = None
         self._ms_token: str | None = None
         self._token_source = ""
+        self._search_id = ""
         self._storage_state = deepcopy(read_state(storage_state))
         saved_cookies = self._storage_state.get("cookies")
         self._cookies = ([deepcopy(c) for c in saved_cookies if isinstance(c, dict)]
@@ -107,6 +122,7 @@ class DouyinClient:
              "domain": ".douyin.com", "path": "/"}
             for part in self.cookie.split(";") if "=" in part
         ])
+        self._account_query = self._account_query_params()
         # The caller verifies this account/session binding; additionally limit
         # the client to supported first-party origins and non-secret fields.
         detail_context = detail_context if isinstance(detail_context, dict) else {}
@@ -148,7 +164,8 @@ class DouyinClient:
             "Cookie": cookie_header(self._cookies, url),
         }
         parsed = urllib.parse.urlsplit(url)
-        if parsed.path == DETAIL_PATH and f"{parsed.scheme}://{parsed.netloc}" in DETAIL_ORIGINS:
+        if (requires_web_signature(parsed.path)
+                and f"{parsed.scheme}://{parsed.netloc}" in DETAIL_ORIGINS):
             for name, value in (self.detail_context.get("headers") or {}).items():
                 for previous in list(headers):
                     if previous.lower() == name.lower():
@@ -157,22 +174,103 @@ class DouyinClient:
             headers.update(web_query_headers(parsed.query))
         return headers
 
+    @staticmethod
+    def _normalized_path(path: str) -> str:
+        value = "/" + str(path or "").lstrip("/")
+        return value if value.endswith("/") else value + "/"
+
+    def _write_security_headers(self, path: str, url: str) -> Dict[str, str]:
+        """Attach deterministic account-bound parts of the web SDK context.
+
+        Douyin's current first-party writer also generates a volatile DTrait
+        header in JavaScript.  That value is deliberately not fabricated here;
+        a confirmed denial is surfaced so hybrid mode can use the logged-in
+        browser, whose official SDK generates it for the real request.
+        """
+        if self._normalized_path(path) not in SECURE_SDK_WRITE_PATHS:
+            return {}
+        headers: Dict[str, str] = {}
+        device_id = self._web_signature_device_id(path)
+        if device_id:
+            headers["uifid"] = device_id
+        csrf = cookie_value(self._cookies, url, "passport_csrf_token")
+        if csrf:
+            headers["x-secsdk-csrf-token"] = csrf
+        ticket = cookie_value(self._cookies, url, "bd_ticket_guard_client_data")
+        if ticket:
+            headers["bd-ticket-guard-client-data"] = ticket
+        return headers
+
     def export_storage_state(self) -> dict:
         state = deepcopy(self._storage_state)
         state["cookies"] = deepcopy(self._cookies)
         state.setdefault("origins", [])
         return state
 
-    def _api_origin(self, path: str) -> str:
-        return self.detail_context.get("origin", BASE) if path == DETAIL_PATH else BASE
+    def replace_storage_state(self, storage_state: dict | str) -> None:
+        """Refresh a direct client from a verified first-party browser state."""
+        state = deepcopy(read_state(storage_state))
+        cookies = state.get("cookies")
+        if not isinstance(cookies, list):
+            return
+        self._storage_state = state
+        self._cookies = [deepcopy(c) for c in cookies if isinstance(c, dict)]
+        self.cookie = cookie_from_state(json.dumps(state, ensure_ascii=False))
+        self._account_query = self._account_query_params()
+        self._ms_token = None
+        self._token_source = ""
+        self._search_id = ""
 
-    def _detail_device_id(self) -> str:
-        url = self._api_origin(DETAIL_PATH) + DETAIL_PATH
+    def _account_query_params(self) -> Dict[str, str]:
+        """Read stable first-party request identity from browser storage."""
+        result: Dict[str, str] = {}
+        for origin in self._storage_state.get("origins", []):
+            if not isinstance(origin, dict) or origin.get("origin") != BASE:
+                continue
+            values = {
+                str(item.get("name") or ""): str(item.get("value") or "")
+                for item in origin.get("localStorage", [])
+                if isinstance(item, dict)
+            }
+            try:
+                tea = json.loads(values.get("__tea_cache_tokens_6383", "{}"))
+            except (TypeError, ValueError):
+                tea = {}
+            if isinstance(tea, dict):
+                webid = str(tea.get("user_unique_id") or tea.get("web_id") or "")
+                if webid.isdigit() and len(webid) <= 32:
+                    result["webid"] = webid
+            break
+        visitor = cookie_value(self._cookies, BASE + "/", "s_v_web_id")
+        if visitor and len(visitor) <= 256 and not re.search(r"[\s;&]", visitor):
+            result.update(verifyFp=visitor, fp=visitor)
+        return result
+
+    def _local_storage_value(self, name: str) -> str:
+        """Read a value from the saved first-party Douyin LocalStorage."""
+        for origin in self._storage_state.get("origins", []):
+            if not isinstance(origin, dict) or origin.get("origin") != BASE:
+                continue
+            for item in origin.get("localStorage", []):
+                if isinstance(item, dict) and item.get("name") == name:
+                    return str(item.get("value") or "")
+        return ""
+
+    def _api_origin(self, path: str) -> str:
+        if path == DETAIL_PATH:
+            return self.detail_context.get("origin", BASE)
+        if self._normalized_path(path) in SECURE_SDK_WRITE_PATHS:
+            return WRITE_BASE
+        return BASE
+
+    def _web_signature_device_id(self, path: str) -> str:
+        url = self._api_origin(path) + path
         for name in UIFID_COOKIES:
             value = cookie_value(self._cookies, url, name)
             if valid_device_id(value):
                 return value
-        value = (self.detail_context.get("params") or {}).get("uifid", "")
+        value = ((self.detail_context.get("params") or {}).get("uifid", "")
+                 if path == DETAIL_PATH else "")
         return value if valid_device_id(value) else ""
 
     async def _prepare_ms_token(self, url: str) -> None:
@@ -181,6 +279,10 @@ class DouyinClient:
         token = cookie_value(self._cookies, url, "msToken")
         if token:
             self._ms_token, self._token_source = token, "account_cookie"
+            return
+        token = self._local_storage_value("xmst")
+        if token:
+            self._ms_token, self._token_source = token, "account_local_storage_xmst"
             return
         self._ms_token = await gen_real_ms_token(
             self.ua, timeout=min(self.timeout, 10.0),
@@ -264,7 +366,7 @@ class DouyinClient:
             "referer": referer,
         }
 
-    def _build_url(self, path: str, params: Dict[str, Any]) -> str:
+    def _build_url(self, path: str, params: Dict[str, Any], *, body: str = "") -> str:
         if path == DETAIL_PATH and self.detail_context:
             # A calibrated request must not retain obsolete defaults that the
             # current first-party endpoint no longer sends.
@@ -283,8 +385,25 @@ class DouyinClient:
                 ver = f"{m.group(1)}.0.0.0"
                 q["browser_version"] = ver
                 q["engine_version"] = ver
+            q.update(self._account_query)
+            if self._normalized_path(path) in SECURE_SDK_WRITE_PATHS:
+                q.update({
+                    "pc_libra_divert": "Windows",
+                    "update_version_code": "170400",
+                    "support_h265": "0",
+                    "support_dash": "0",
+                    "version_code": "170400",
+                    "version_name": "17.4.0",
+                })
         q.update({k: v for k, v in params.items() if v is not None})
-        q["msToken"] = self._ms_token or gen_false_ms_token()
+        normalized_path = self._normalized_path(path)
+        if normalized_path == SEARCH_STREAM_PATH:
+            q.pop("msToken", None)
+            device_id = self._web_signature_device_id(path)
+            if device_id:
+                q["uifid"] = device_id
+        else:
+            q["msToken"] = self._ms_token or gen_false_ms_token()
         if path == DETAIL_PATH:
             for name in ("timestamp", "x-secsdk-web-signature", "uifid", "a_bogus"):
                 q.pop(name, None)
@@ -293,9 +412,14 @@ class DouyinClient:
                 q.update(verifyFp=visitor, fp=visitor)
         qs = urllib.parse.urlencode(q)
         fingerprint = (self.detail_context.get("fingerprint") if path == DETAIL_PATH else "")
-        signed = sign_url(qs, self.ua, fp=fingerprint or self._abogus_fingerprint())
-        if path == DETAIL_PATH and self._detail_device_id():
-            signed = sign_web_query(signed, self._detail_device_id())
+        # Current first-party/open-source search clients send search/single
+        # without a_bogus. Keep the signature for all other API families.
+        signed = qs if normalized_path in SEARCH_PATHS else sign_url(
+            qs, self.ua, body=body,
+            fp=fingerprint or self._abogus_fingerprint())
+        device_id = self._web_signature_device_id(path)
+        if requires_web_signature(path) and device_id:
+            signed = sign_web_query(signed, device_id)
         return f"{self._api_origin(path)}{path}?{signed}"
 
     def _abogus_fingerprint(self) -> str:
@@ -308,15 +432,15 @@ class DouyinClient:
             f"{platform}"
         )
 
-    async def _get_json(self, path: str, params: Dict[str, Any],
-                        referer: str = BASE + "/") -> Optional[dict]:
+    async def _get_payloads(self, path: str, params: Dict[str, Any],
+                            referer: str = BASE + "/") -> List[dict]:
         self.last_error = ""
         self.last_response = {}
-        if path == DETAIL_PATH and not self._detail_device_id():
+        if requires_web_signature(path) and not self._web_signature_device_id(path):
             self.last_error = "api_signature:missing_uifid"
             self.last_response = {"origin": self._api_origin(path), "path": path,
                                   "rejection_reason": "missing_uifid", "request_sent": False}
-            return None
+            return []
         owned = self._session is None
         cli = self._session or AsyncSession(impersonate=self.impersonate)
         try:
@@ -343,27 +467,35 @@ class DouyinClient:
                 # 空 body,页面里发同一个请求却正常)。静默 return None 会让上层把「被拒」
                 # 和「没有数据」混为一谈 —— 那正是 raw=0 查了半天的原因。
                 self.last_error = f"http_{r.status_code}" if r.status_code != 200 else "empty_body"
-                if path == DETAIL_PATH and r.status_code != 200:
+                if requires_web_signature(path) and r.status_code != 200:
                     self.last_error, reason = detail_http_error(r.status_code, r.content)
                     if reason:
                         self.last_response["rejection_reason"] = reason
                 print(f"[dy-client] {path} → HTTP {r.status_code} len={len(r.content)}"
                       f"{' (空 body:多半被风控拒,非无数据)' if r.status_code == 200 else ''}")
-                return None
+                return []
             try:
                 payload = r.json()
                 if isinstance(payload, dict):
                     code = payload.get("status_code")
                     self.last_response["business_code"] = code if isinstance(code, int) else None
                     self.last_response["response_keys"] = sorted(payload)[:20]
-                return payload
+                return [payload] if isinstance(payload, dict) else []
             except Exception:
                 body = r.content.decode("utf-8", errors="ignore") if isinstance(r.content, bytes) else ""
+                from ...browser.fetcher import decode_douyin_search_payloads
+                payloads = decode_douyin_search_payloads(r.content or b"")
+                if payloads:
+                    self.last_response["stream_payloads"] = len(payloads)
+                    self.last_response["response_keys"] = sorted({
+                        key for payload in payloads for key in payload
+                    })[:20]
+                    return payloads
                 self.last_error = ("risk:verification_required:html" if re.search(
                     r"<title[^>]*>[^<]*(?:验证码中间页|安全验证|人机验证)", body, re.I)
                     else "invalid_json")
                 print(f"[dy-client] {path} → 非 JSON len={len(r.content)}")
-                return None
+                return []
         except Exception as exc:
             self.last_error = f"network:{type(exc).__name__}"
             raise
@@ -371,6 +503,11 @@ class DouyinClient:
             if owned:
                 await cli.close()
                 self._ms_token = None
+
+    async def _get_json(self, path: str, params: Dict[str, Any],
+                        referer: str = BASE + "/") -> Optional[dict]:
+        payloads = await self._get_payloads(path, params, referer=referer)
+        return payloads[0] if payloads else None
 
     async def _post_json(self, path: str, params: Dict[str, Any],
                          form: Dict[str, Any], *,
@@ -382,31 +519,80 @@ class DouyinClient:
         必须停止重试并把任务标为 ``uncertain``。
         """
         self.last_error = ""
+        self.last_response = {}
         self.last_write_uncertain = False
         owned = self._session is None
         cli = self._session or AsyncSession(impersonate=self.impersonate)
         try:
-            await self._prepare_ms_token(BASE + path)
-            url = self._build_url(path, params)
-            headers = self._headers(referer)
+            await self._prepare_ms_token(self._api_origin(path) + path)
+            # a_bogus hashes the exact application/x-www-form-urlencoded body.
+            # Build it once and use the same spelling for signing and transport.
+            form_fields = {k: str(v) for k, v in form.items() if v is not None}
+            encoded_form = urllib.parse.urlencode(form_fields)
+            url = self._build_url(path, params, body=encoded_form)
+            request_token_source = self._token_source
+            headers = self._headers(referer, url=url)
             headers.update({
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "Origin": BASE,
             })
+            headers.update(self._write_security_headers(path, url))
             response = await cli.post(
-                url, data={k: str(v) for k, v in form.items() if v is not None},
+                url, data=encoded_form,
                 headers=headers, impersonate=self.impersonate, timeout=self.timeout,
-                proxy=self.proxy or None)
+                proxy=self.proxy or None, allow_redirects=False)
+            self._accept_response_cookies(response, url)
+            response_headers = getattr(response, "headers", {}) or {}
+            secure_path = self._normalized_path(path) in SECURE_SDK_WRITE_PATHS
+            parsed_url = urllib.parse.urlsplit(url)
+            self.last_response = {
+                "origin": f"{parsed_url.scheme}://{parsed_url.netloc}",
+                "path": path,
+                "http_status": response.status_code,
+                "body_bytes": len(response.content or b""),
+                "content_type": str(response_headers.get("content-type", ""))[:100],
+                "token_source": request_token_source,
+                "a_bogus_body_bound": True,
+                "device_header_attached": "uifid" in headers,
+                "csrf_header_attached": "x-secsdk-csrf-token" in headers,
+                "ticket_guard_client_attached": (
+                    "bd-ticket-guard-client-data" in headers),
+                "dtrait_header_attached": "x-tt-session-dtrait" in headers,
+                "browser_security_context_required": secure_path,
+                "ticket_guard_result": str(
+                    response_headers.get("bd-ticket-guard-result", ""))[:100],
+                "verify_passport_decision": bool(
+                    response_headers.get("x-tt-verify-passport-decision")),
+            }
             if response.status_code != 200 or not response.content:
-                self.last_error = (f"http_{response.status_code}"
-                                   if response.status_code != 200 else "empty_body")
+                if response.status_code == 401:
+                    self.last_error = "logged_out"
+                elif response.status_code == 403 and secure_path:
+                    self.last_error = "api_requires_browser_security:http_403"
+                    self.last_response["rejection_reason"] = (
+                        "browser_security_context_required")
+                elif response.status_code == 429:
+                    self.last_error = "risk:rate_limited:http_429"
+                else:
+                    self.last_error = (f"http_{response.status_code}"
+                                       if response.status_code != 200 else "empty_body")
                 self.last_write_uncertain = (
                     response.status_code >= 500 or response.status_code == 200)
                 return None
             try:
-                return response.json()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    code = payload.get("status_code")
+                    self.last_response["business_code"] = (
+                        code if isinstance(code, int) else None)
+                    self.last_response["response_keys"] = sorted(payload)[:20]
+                return payload
             except Exception:
-                self.last_error = "invalid_json"
+                body = (response.content.decode("utf-8", errors="ignore")
+                        if isinstance(response.content, bytes) else "")
+                self.last_error = ("risk:verification_required:html" if re.search(
+                    r"<title[^>]*>[^<]*(?:验证码中间页|安全验证|人机验证)",
+                    body, re.I) else "invalid_json")
                 self.last_write_uncertain = True
                 return None
         except Exception as exc:
@@ -430,6 +616,16 @@ class DouyinClient:
         if str(code) == "0":
             return True, ""
         message = str(data.get("status_msg") or data.get("message") or "")
+        if str(code) == "8" and any(marker in message for marker in (
+                "用户未登录", "未登录", "登录态已失效")):
+            if (self.last_response.get("browser_security_context_required")
+                    and not self.last_response.get("dtrait_header_attached")):
+                self.last_error = "api_requires_browser_security:status_code=8"
+                return False, (
+                    "api_requires_browser_security:status_code=8"
+                    f"{(' ' + message) if message else ''}")
+            self.last_error = "logged_out"
+            return False, f"logged_out{(':' + message) if message else ''}"
         return False, f"api_rejected:status_code={code}{(' ' + message) if message else ''}"
 
     def _write_error(self, fallback: str) -> str:
@@ -489,12 +685,10 @@ class DouyinClient:
             return False, "缺少 target_uid，且无法由 sec_uid 解析用户"
         data = await self._post_json(
             "/aweme/v1/web/commit/follow/user/",
-            {"user_id": user_id, "sec_user_id": sec_uid},
+            {},
             {
                 "user_id": user_id,
-                "sec_user_id": sec_uid,
                 "type": 2 if unfollow else 1,
-                "from": 0,
             },
             referer=f"{BASE}/user/{sec_uid or user_id}")
         return self._write_result(
@@ -733,32 +927,85 @@ class DouyinClient:
         time_codes = {"all": "0", "day": "1", "week": "7", "half_year": "180"}
         params = {
             "keyword": keyword,
-            "search_channel": "aweme",
-            "search_source": "normal_search",
+            "search_channel": "aweme_general",
+            "search_source": "tab_search",
             "query_correct_type": "1",
             "is_filter_search": "0",
             "offset": max(0, int(offset or 0)),
-            "count": max(1, min(50, int(count or 20))),
-            "sort_type": sort_codes.get(search_sort, "0"),
-            "publish_time": time_codes.get(publish_time, "0"),
-            "type": "video" if content_type == "video" else "general",
+            "count": max(1, min(50, int(count or 15))),
+            "list_type": "multi",
+            "search_id": self._search_id,
+            "need_filter_settings": "1",
+            "enable_history": "1",
+            "from_group_id": "",
+            "type": "video" if content_type == "video" else None,
         }
-        data = await self._get_json(
-            "/aweme/v1/web/general/search/single/", params,
+        if search_sort != "general" or publish_time != "all":
+            params["is_filter_search"] = "1"
+            params["filter_selected"] = json.dumps({
+                "sort_type": sort_codes.get(search_sort, "0"),
+                "publish_time": time_codes.get(publish_time, "0"),
+            }, ensure_ascii=False, separators=(",", ":"))
+        payloads = await self._get_payloads(
+            SEARCH_SINGLE_PATH, params,
             referer=f"{BASE}/search/{urllib.parse.quote(keyword, safe='')}")
-        if not data:
+        single_error = self.last_error
+        structurally_unsupported = bool(payloads) and all(
+            not any(key in data for key in (
+                "data", "search_nil_info", "has_more", "extra", "log_pb"))
+            and data.get("status_code") in (None, 0, "0")
+            for data in payloads)
+        if ((not payloads and single_error in {"invalid_json", "http_404", "http_405"})
+                or structurally_unsupported):
+            stream_params = dict(params)
+            stream_params["list_type"] = "single"
+            payloads = await self._get_payloads(
+                SEARCH_STREAM_PATH, stream_params,
+                referer=f"{BASE}/search/{urllib.parse.quote(keyword, safe='')}")
+        if not payloads:
             return {"items": [], "has_more": False, "offset": offset,
                     "error": self.last_error or "empty_response"}
-        nil_info = data.get("search_nil_info") or {}
-        marker = " ".join(str(nil_info.get(k) or "") for k in
-                          ("search_nil_type", "search_nil_item", "text_type"))
-        if any(word in marker.casefold() for word in ("verify", "captcha", "risk")):
-            return {"items": [], "has_more": False, "offset": offset,
-                    "error": "verification_required"}
-        items = extract_search_awemes(data)
+        found: Dict[str, dict] = {}
+        has_more = False
+        next_offset = offset
+        for data in payloads:
+            next_search_id = str(
+                (data.get("extra") or {}).get("logid")
+                or (data.get("log_pb") or {}).get("impr_id") or "")
+            if next_search_id:
+                self._search_id = next_search_id
+            code = data.get("status_code")
+            message = str(data.get("status_msg") or data.get("message") or "")
+            if code not in (None, 0, "0"):
+                marker = message.casefold()
+                if str(code) in {"8", "2483"} or any(word in marker for word in (
+                        "未登录", "登录后", "请先登录", "login")):
+                    self.last_error = "logged_out"
+                    return {"items": [], "has_more": False, "offset": offset,
+                            "error": "logged_out"}
+                if any(word in marker for word in (
+                        "verify", "captcha", "risk", "验证", "风控")):
+                    self.last_error = "verification_required"
+                    return {"items": [], "has_more": False, "offset": offset,
+                            "error": "verification_required"}
+                self.last_error = f"api_rejected:status_code={code}"
+                return {"items": [], "has_more": False, "offset": offset,
+                        "error": self.last_error}
+            nil_info = data.get("search_nil_info") or {}
+            marker = " ".join(str(nil_info.get(k) or "") for k in
+                              ("search_nil_type", "search_nil_item", "text_type"))
+            if any(word in marker.casefold() for word in ("verify", "captcha", "risk")):
+                self.last_error = "verification_required"
+                return {"items": [], "has_more": False, "offset": offset,
+                        "error": "verification_required"}
+            for item in extract_search_awemes(data):
+                found.setdefault(str(item.get("aweme_id") or ""), item)
+            has_more = has_more or bool(data.get("has_more") or data.get("has_more_item"))
+            next_offset = max(next_offset, int(data.get("offset") or 0))
+        items = [item for key, item in found.items() if key]
         return {"items": items,
-                "has_more": bool(data.get("has_more") or data.get("has_more_item")),
-                "offset": int(data.get("offset") or (offset + len(items))),
+                "has_more": has_more,
+                "offset": next_offset or (offset + len(items)),
                 "error": ""}
 
     async def search_awemes(self, keyword: str, *, max_results: int = 20,
@@ -767,6 +1014,8 @@ class DouyinClient:
                             min_likes: int = 0, min_comments: int = 0) -> tuple[List[dict], str]:
         """分页搜索并做本地筛选；返回 (作品列表, 可回退原因)。"""
         import time
+        # search_id belongs to one keyword pagination chain, not the account.
+        self._search_id = ""
         found: Dict[str, dict] = {}
         offset = 0
         for _ in range(max(1, min(10, int(max_pages or 1)))):

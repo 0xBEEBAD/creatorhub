@@ -14,8 +14,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from patchright.async_api import BrowserContext, async_playwright
@@ -1790,6 +1793,36 @@ class BrowserManager:
             else:
                 with suppress(Exception):
                     await ctx.close()
+
+    @asynccontextmanager
+    async def temporary_fresh_headed_context(self, identity: Identity):
+        """Open one isolated visible context while preserving account cookies.
+
+        Douyin can bind a verification state to the persistent browser profile even
+        after the signed read API starts returning verification_required. A unique
+        profile gives the idempotent browser retry a clean security context while
+        keeping the account cookie bridge and stable device identity unchanged.
+        """
+        profile = (Path(self.profiles_root) / "_douyin_read"
+                   / f"acc_{identity.account_id or 'anon'}_{uuid.uuid4().hex}")
+        fresh_identity = replace(
+            identity,
+            account_id=None,
+            profile_dir=str(profile),
+        )
+        ctx = None
+        try:
+            ctx = await self._launch_persistent(fresh_identity, headless=False)
+            await self._bridge_identity_cookies(
+                ctx, identity, assume_empty=True, overwrite=True)
+            yield ctx
+        finally:
+            if ctx is not None:
+                with suppress(Exception):
+                    await ctx.close()
+            self._release_profile_lock(fresh_identity.key)
+            with suppress(Exception):
+                shutil.rmtree(profile)
 
 
 # 各平台 Cookie 顶域(子域如 creator./edith. 都吃顶域 cookie,一个就够)
