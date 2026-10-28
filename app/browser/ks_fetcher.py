@@ -14,6 +14,7 @@ import asyncio
 import json
 import re
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 from .identity import Identity
 from .manager import BrowserManager
@@ -23,8 +24,10 @@ GRAPHQL_API = "/graphql"
 COMMENT_API = "/rest/v/photo/comment/"
 # 作品列表现走 REST(实测 [ks_videos] 只见 /rest/v/profile/feed,无 graphql)
 PROFILE_FEED_API = "/rest/v/profile/feed"
+SEARCH_FEED_API = "/rest/v/search/feed"
 PROFILE_URL = "https://www.kuaishou.com/profile/{uid}"
 PHOTO_URL = "https://www.kuaishou.com/short-video/{pid}"
+SEARCH_URL = "https://www.kuaishou.com/search/video?searchKey={keyword}"
 
 
 def _rf(d: dict, *keys, default=""):
@@ -65,6 +68,32 @@ def _dig_feeds(data: dict) -> list:
     return []
 
 
+def _feed_id(feed: dict) -> str:
+    if not isinstance(feed, dict):
+        return ""
+    photo = feed.get("photo") if isinstance(feed.get("photo"), dict) else feed
+    return str(_rf(photo, "id", "photoId", "photo_id", default="") or "")
+
+
+def _search_feeds(data: dict) -> list:
+    """兼容快手 REST 搜索与 GraphQL 搜索的常见响应外形。"""
+    values = _dig_rest_feeds(data)
+    if values:
+        return values
+    values = _dig_feeds(data)
+    if values:
+        return values
+    payload = (data or {}).get("data") if isinstance(data, dict) else None
+    if isinstance(payload, dict):
+        for key in ("visionSearchPhoto", "searchPhoto", "photoList"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                values = value.get("feeds") or value.get("list") or []
+                if isinstance(values, list):
+                    return values
+    return []
+
+
 def _dig_profile(data: dict) -> Optional[dict]:
     """从 visionProfile 响应里挖出 userProfile。"""
     d = (data or {}).get("data") or {}
@@ -94,6 +123,104 @@ def _dig_comments(data: dict) -> list:
             if isinstance(rc, list):
                 return rc
     return []
+
+
+async def fetch_ks_search(mgr: BrowserManager, identity: Identity, keyword: str,
+                          known_ids: Set[str], max_scrolls: int = 12,
+                          settle_ms: int = 1800, block_media: bool = True,
+                          stagnant_limit: int = 3
+                          ) -> Tuple[List[dict], str]:
+    """打开快手搜索页并拦截页面签名后的 REST/GraphQL 搜索响应。"""
+    collected: Dict[str, dict] = {}
+    error = ""
+    api_seen: List[str] = []
+    page = await mgr.new_page(identity, block_media)
+
+    async def on_response(resp):
+        url = resp.url
+        is_rest = SEARCH_FEED_API in url
+        is_graphql = GRAPHQL_API in url
+        if not is_rest and not is_graphql:
+            return
+        operation = ""
+        if is_graphql:
+            try:
+                post_data = resp.request.post_data or ""
+                match = re.search(r'"operationName"\s*:\s*"([^"]+)"', post_data)
+                operation = match.group(1) if match else ""
+            except Exception:
+                pass
+            if operation not in {"visionSearchPhoto", "visionSearchPhotoV2"}:
+                return
+        if len(api_seen) < 40:
+            api_seen.append(
+                f"{resp.status} {'gql:' + (operation or '?') if is_graphql else SEARCH_FEED_API}")
+        try:
+            data = await resp.json()
+        except Exception:
+            return
+        for raw in _search_feeds(data):
+            if not isinstance(raw, dict):
+                continue
+            feed = raw if isinstance(raw.get("photo"), dict) else {
+                "photo": raw,
+                "author": raw.get("author") or raw.get("user") or {},
+            }
+            photo_id = _feed_id(feed)
+            if photo_id:
+                collected.setdefault(photo_id, feed)
+
+    page.on("response", on_response)
+    final_url = ""
+    try:
+        await page.goto(
+            SEARCH_URL.format(keyword=quote(keyword, safe="")),
+            wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(settle_ms)
+        stagnant = 0
+        for _ in range(max(1, min(40, int(max_scrolls or 1)))):
+            before = len(collected)
+            try:
+                await page.evaluate("""() => {
+                  window.scrollTo(0, document.body.scrollHeight);
+                  for (const el of document.querySelectorAll('*')) {
+                    const style = getComputedStyle(el);
+                    if ((style.overflowY === 'auto' || style.overflowY === 'scroll')
+                        && el.scrollHeight > el.clientHeight + 20) {
+                      el.scrollTop = el.scrollHeight;
+                    }
+                  }
+                }""")
+            except Exception:
+                pass
+            await page.mouse.wheel(0, 4200)
+            await page.wait_for_timeout(settle_ms)
+            if len(collected) == before:
+                stagnant += 1
+                if collected and stagnant >= max(
+                        1, min(8, int(stagnant_limit or 1))):
+                    break
+            else:
+                stagnant = 0
+        final_url = page.url
+        if not collected:
+            if "passport" in final_url or "/login" in final_url:
+                error = "logged_out:登录态失效,请重新登录"
+            else:
+                error = "未拦截到快手搜索结果(关键词可能无结果或页面接口已调整)"
+    except Exception as exc:
+        error = f"打开快手搜索页失败: {exc!r}"
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if not collected:
+        print(f"[ks_search] keyword={keyword!r} final_url={final_url} "
+              f"api_seen({len(api_seen)})={api_seen[:40]}")
+    return [feed for photo_id, feed in collected.items()
+            if photo_id not in known_ids], error
 
 
 async def fetch_ks_videos(mgr: BrowserManager, identity: Identity, user_id: str,

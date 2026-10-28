@@ -9,11 +9,15 @@
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import hmac
 import json
 import os
 import random
+import shutil
+import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -28,6 +32,117 @@ if str(_NODE_MODULES) not in _existing:
 
 _JS_CACHE: dict = {}
 _AVAILABLE: bool | None = None
+_WORKERS: dict[str, "_NodeSigner"] = {}
+_WORKERS_LOCK = threading.Lock()
+
+
+class _NodeSigner:
+    """Keep one Node process alive per signing bundle.
+
+    PyExecJS launches a new Node process for every call. A normal XHS
+    collection page signs multiple requests, so process startup dominates the
+    API latency. This line-delimited JSON bridge loads the existing reviewed JS
+    bundle once and serializes calls through one account-independent runtime.
+    """
+
+    def __init__(self, filename: str):
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("node runtime not found")
+        module_path = str((_STATIC / filename).resolve())
+        bridge = r"""
+const readline = require('readline');
+const mod = require(process.argv[1]);
+const rl = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+rl.on('line', line => {
+  let request;
+  try {
+    request = JSON.parse(line);
+    const fn = mod[request.function];
+    if (typeof fn !== 'function') throw new Error('unknown function: ' + request.function);
+    const result = fn.apply(null, request.args || []);
+    process.stdout.write('__CREATORHUB_SIGNER__' + JSON.stringify({
+      id: request.id, ok: true, result
+    }) + '\n');
+  } catch (error) {
+    process.stdout.write('__CREATORHUB_SIGNER__' + JSON.stringify({
+      id: request && request.id, ok: false,
+      error: String(error && (error.stack || error.message) || error)
+    }) + '\n');
+  }
+});
+"""
+        env = os.environ.copy()
+        env["NODE_PATH"] = os.environ.get("NODE_PATH", "")
+        self._process = subprocess.Popen(
+            [node, "-e", bridge, module_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            bufsize=1, env=env, creationflags=(
+                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+        self._lock = threading.Lock()
+        self._request_id = 0
+
+    def call(self, function: str, *args):
+        with self._lock:
+            if self._process.poll() is not None:
+                error = self._process.stderr.read() if self._process.stderr else ""
+                raise RuntimeError(f"xhs signer exited: {error.strip()}")
+            self._request_id += 1
+            payload = json.dumps({
+                "id": self._request_id, "function": function, "args": args,
+            }, ensure_ascii=False, separators=(",", ":"))
+            assert self._process.stdin is not None
+            assert self._process.stdout is not None
+            self._process.stdin.write(payload + "\n")
+            self._process.stdin.flush()
+            marker = "__CREATORHUB_SIGNER__"
+            while True:
+                line = self._process.stdout.readline()
+                if not line:
+                    error = self._process.stderr.read() if self._process.stderr else ""
+                    raise RuntimeError(
+                        f"xhs signer produced no response: {error.strip()}")
+                if line.startswith(marker):
+                    response = json.loads(line[len(marker):])
+                    break
+            if response.get("id") != self._request_id:
+                raise RuntimeError("xhs signer response id mismatch")
+            if not response.get("ok"):
+                raise RuntimeError(str(response.get("error") or "xhs signer failed"))
+            return response.get("result")
+
+    def close(self) -> None:
+        process = self._process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+def _worker(filename: str) -> _NodeSigner:
+    with _WORKERS_LOCK:
+        current = _WORKERS.get(filename)
+        if current is None or current._process.poll() is not None:
+            if current is not None:
+                current.close()
+            current = _NodeSigner(filename)
+            _WORKERS[filename] = current
+        return current
+
+
+def close_signers() -> None:
+    with _WORKERS_LOCK:
+        workers = list(_WORKERS.values())
+        _WORKERS.clear()
+    for worker in workers:
+        worker.close()
+
+
+atexit.register(close_signers)
 
 
 def _ctx(filename: str):
@@ -43,8 +158,7 @@ def available() -> bool:
     if _AVAILABLE is not None:
         return _AVAILABLE
     try:
-        import execjs  # noqa
-        r = _ctx("xhs_creator_260411.js").call(
+        r = _worker("xhs_creator_260411.js").call(
             "get_request_headers_params", "/api/test", "", "a1test")
         _AVAILABLE = bool(r and r.get("xs"))
     except Exception:
@@ -53,14 +167,16 @@ def available() -> bool:
 
 
 def generate_xs_xs_common(a1: str, api: str, data="") -> tuple:
-    ret = _ctx("xhs_creator_260411.js").call("get_request_headers_params", api, data, a1)
+    ret = _worker("xhs_creator_260411.js").call(
+        "get_request_headers_params", api, data, a1)
     return ret["xs"], ret["xt"], ret["xs_common"]
 
 
 def generate_xsc_main(a1: str, api: str, data="", method: str = "GET") -> dict:
     """网页主签名(xhs_main_260411.js,带 method)。用于 www/edith 的带参 GET 等。
     api 传"路径?query"(splice_str 结果),data='',method='GET'(对齐 Spider_XHS)。"""
-    ret = _ctx("xhs_main_260411.js").call("get_request_headers_params", api, data, a1, method)
+    ret = _worker("xhs_main_260411.js").call(
+        "get_request_headers_params", api, data, a1, method)
     return {
         "x-s": ret["xs"], "x-t": str(ret["xt"]), "x-s-common": ret["xs_common"],
         "x-b3-traceid": gen_b3_traceid(), "x-xray-traceid": gen_xray_traceid(),
@@ -70,6 +186,8 @@ def generate_xsc_main(a1: str, api: str, data="", method: str = "GET") -> dict:
 def generate_x_rap_param(api: str, data="") -> str:
     if isinstance(data, (dict, list)):
         data = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    # xhs_rap.js is not a CommonJS export. It is only needed for the final
+    # publish submit, not routine high-volume reads, so retain ExecJS here.
     return _ctx("xhs_rap.js").call("generate_x_rap_param", api, data or "", None)
 
 

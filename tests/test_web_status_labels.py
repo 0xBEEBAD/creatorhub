@@ -16,24 +16,31 @@ def test_xhs_note_card_uses_chinese_status_label_mapper():
     assert ">${r.download_status}${r.error" not in note_card
 
 
-def test_keyword_collection_supports_douyin_and_xhs_with_edit_action():
+def test_keyword_collection_supports_four_platforms_with_channels_account_only_source():
     source = APP_JS.read_text(encoding="utf-8")
     html = INDEX_HTML.read_text(encoding="utf-8")
     workbench = WORKBENCH_JSX.read_text(encoding="utf-8")
 
-    assert '!["douyin", "xhs"].includes(PLATFORM) && CURRENT_TAB === "collections"' in source
+    assert '!["douyin", "xhs", "kuaishou", "shipinhao"].includes(PLATFORM) && CURRENT_TAB === "collections"' in source
     assert 'platform: PLATFORM, account_id: accountId' in source
     assert 'a.platform === PLATFORM' in source
     assert 'platform: job.platform, keywords' in source
+    assert '.filter(job => job.platform === requestedPlatform)' in source
     assert 'onclick="editCollection(${job.id})"' in source
-    assert 'canRetry && ["douyin", "xhs"].includes(job.platform)' in source
+    assert 'canRetry && ["douyin", "xhs", "kuaishou", "shipinhao"].includes(job.platform)' in source
     assert 'canRetry && job.platform === "douyin"' not in source
     assert '@app.put' not in html
     assert 'id="collection-create-title"' in html
-    assert "新建${xhs ? \"小红书\" : \"抖音\"}关键词采集" in source
-    assert 'platform === "xhs" ? "小红书" : "抖音"' in workbench
+    assert "新建${platformName}关键词采集" in source
+    assert 'kuaishou: "快手"' in workbench
+    assert '"快手 user_id / 3x ID"' in source
+    assert 'value="account_works" data-channels-source>本账号作品' in html
+    assert 'PLATFORM === "shipinhao" ? "account_works"' in source
+    assert '新建视频号本账号作品采集' in source
+    assert '仅采集当前登录视频号账号自己的已发布作品' in source
+    assert 'platform === "shipinhao" ? "新建视频号本账号作品采集"' in workbench
     assert "composerTitle(ctx.tab, ctx.platform)" in workbench
-    assert "批量搜索平台作品" in source[source.index("collections: {"):source.index("comments: {")]
+    assert "按平台支持的来源批量采集作品" in source[source.index("collections: {"):source.index("comments: {")]
 
 
 def test_keyword_collection_results_have_card_layout_and_file_preview_actions():

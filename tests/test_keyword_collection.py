@@ -26,6 +26,7 @@ from app.browser.fetcher import (
 from app.config import Config
 from app.engine.collection import (
     KeywordCollector,
+    _sort_ks_search_items,
     _sort_xhs_search_items,
     _xhs_content_matches,
 )
@@ -38,6 +39,7 @@ from app.main import (
     _collection_keywords,
     export_keyword_collection,
     list_keyword_collection_comments,
+    list_keyword_collections,
     create_keyword_collection,
     keyword_collection_content_media,
     keyword_collection_local_media,
@@ -741,6 +743,53 @@ class KeywordCollectionEditTests(unittest.TestCase):
         self.assertEqual(result["search_sort"], "latest")
         self.assertEqual(result["content_type"], "images")
 
+    def test_kuaishou_collection_creation_uses_matching_logged_in_account(self):
+        with db.get_session() as session:
+            account = DouyinAccount(
+                platform="kuaishou", nickname="快手采集账号", status="active",
+                storage_state='{"cookies":[{"name":"passToken","value":"fixture"}]}',
+            )
+            session.add(account); session.commit(); session.refresh(account)
+            account_id = account.id
+
+        result = asyncio.run(create_keyword_collection(self._body(
+            platform="kuaishou", account_id=account_id,
+            search_sort="most_liked", content_type="video")))
+
+        self.assertEqual(result["platform"], "kuaishou")
+        self.assertEqual(result["account_id"], account_id)
+        self.assertEqual(result["search_sort"], "most_liked")
+
+    def test_channels_collection_only_accepts_current_account_works(self):
+        with db.get_session() as session:
+            account = DouyinAccount(
+                platform="shipinhao", nickname="视频号采集账号", status="active",
+                sec_uid="finder-fixture",
+                storage_state='{"cookies":[{"name":"_finder_auth","value":"fixture"}]}',
+            )
+            session.add(account); session.commit(); session.refresh(account)
+            account_id = account.id
+
+        result = asyncio.run(create_keyword_collection(self._body(
+            platform="shipinhao", account_id=account_id,
+            source_type="account_works", source_name="", keywords=[],
+            download_media=False)))
+
+        self.assertEqual(result["platform"], "shipinhao")
+        self.assertEqual(result["source_type"], "account_works")
+        self.assertEqual(result["source_name"], "本账号作品")
+        self.assertEqual(result["keywords"], [])
+        filtered = asyncio.run(list_keyword_collections(platform="shipinhao"))
+        self.assertEqual([job["id"] for job in filtered], [result["id"]])
+
+        for source_type in ("keyword", "creator"):
+            with self.subTest(source_type=source_type), self.assertRaises(HTTPException) as caught:
+                asyncio.run(create_keyword_collection(self._body(
+                    platform="shipinhao", account_id=account_id,
+                    source_type=source_type, source_ref="someone")))
+            self.assertEqual(caught.exception.status_code, 400)
+            self.assertIn("本账号作品", caught.exception.detail)
+
     def test_finished_xhs_task_can_be_edited_but_not_moved_between_platforms(self):
         with db.get_session() as session:
             account = DouyinAccount(
@@ -893,6 +942,206 @@ class XhsKeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
         rejected = self._note("rejected", int(__import__("time").time()), 99, 2)[0]
         self.assertTrue(_xhs_content_matches(accepted, job))
         self.assertFalse(_xhs_content_matches(rejected, job))
+
+
+class KuaishouKeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.previous_engine = db._engine
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db.init_db(str(Path(self.temp_dir.name) / "ks-collection.db"))
+        with db.get_session() as session:
+            account = DouyinAccount(
+                platform="kuaishou", nickname="快手采集账号", status="active",
+                storage_state='{"cookies":[{"name":"passToken","value":"fixture"}]}',
+            )
+            session.add(account); session.commit(); session.refresh(account)
+            job = KeywordCollectionJob(
+                platform="kuaishou", account_id=account.id,
+                keywords='["露营"]', max_contents_per_keyword=1,
+                max_pages_per_keyword=4, search_sort="most_liked",
+                publish_time="week", content_type="video",
+                min_likes=100, min_comments=2,
+                max_comments_per_content=2, include_replies=True,
+            )
+            session.add(job); session.commit(); session.refresh(job)
+            self.account = SimpleNamespace(
+                id=account.id, platform="kuaishou",
+                storage_state=account.storage_state, proxy="")
+            self.job_id = job.id
+        self.identity = SimpleNamespace(ua="fixture-agent")
+        self.browser = SimpleNamespace(identity_for=lambda _account: self.identity)
+        self.collector = KeywordCollector(
+            Config(), self.browser, SimpleNamespace())
+
+    async def asyncTearDown(self):
+        if db._engine is not None:
+            db._engine.dispose()
+        db._engine = self.previous_engine
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _feed(photo_id: str, likes: int, comments: int, *, age: int = 60):
+        return {
+            "photo": {
+                "id": photo_id, "caption": photo_id,
+                "timestamp": (int(__import__("time").time()) - age) * 1000,
+                "realLikeCount": likes, "commentCount": comments,
+                "photoUrl": f"https://media.test/{photo_id}.mp4",
+            },
+            "author": {"id": f"author-{photo_id}", "name": "快手作者"},
+        }
+
+    async def test_keyword_pipeline_filters_persists_and_collects_replies(self):
+        self.collector._discover_ks = AsyncMock(return_value=([
+            self._feed("low", 5, 20),
+            self._feed("keep", 500, 8),
+        ], ""))
+        self.collector._ks_comments = AsyncMock(return_value=([{
+            "comment_id": "root", "text": "根评论", "user_nickname": "甲",
+            "like_count": 2, "create_time": 100, "reply_to": "",
+        }, {
+            "comment_id": "reply", "text": "回复", "user_nickname": "乙",
+            "like_count": 1, "create_time": 101, "reply_to": "root",
+        }], ""))
+
+        with patch("app.engine.collection.asyncio.sleep", new=AsyncMock()):
+            result = await self.collector.run(self.job_id, self.account)
+
+        self.assertEqual(result["contents"], 1)
+        self.assertEqual(result["comments"], 2)
+        self.collector._discover_ks.assert_awaited_once()
+        self.collector._ks_comments.assert_awaited_once_with(
+            self.identity, "keep", 2, True)
+        with db.get_session() as session:
+            row = session.exec(select(KeywordCollectionContent)).one()
+        self.assertEqual(row.aweme_id, "keep")
+        self.assertEqual(row.author_id, "author-keep")
+        self.assertEqual(row.platform, "kuaishou")
+        self.assertEqual(
+            _collection_content_dict(row)["url"],
+            "https://www.kuaishou.com/short-video/keep")
+
+    async def test_creator_source_uses_profile_feed_path(self):
+        with db.get_session() as session:
+            job = session.get(KeywordCollectionJob, self.job_id)
+            job.source_type = "creator"
+            job.source_ref = "3xCREATOR"
+            job.source_name = "创作者 3xCREATOR"
+            job.max_comments_per_content = 0
+            job.min_likes = 0
+            job.min_comments = 0
+            job.publish_time = "all"
+            session.add(job); session.commit()
+        self.collector._discover_ks = AsyncMock(
+            side_effect=AssertionError("creator source must not use search"))
+        self.collector._discover_ks_creator = AsyncMock(return_value=([
+            self._feed("creator-work", 20, 1),
+        ], ""))
+
+        with patch("app.engine.collection.asyncio.sleep", new=AsyncMock()):
+            result = await self.collector.run(self.job_id, self.account)
+
+        self.assertEqual(result["contents"], 1)
+        self.collector._discover_ks_creator.assert_awaited_once()
+        self.collector._discover_ks.assert_not_awaited()
+
+    def test_kuaishou_sort_uses_timestamp_and_like_count(self):
+        old_popular = self._feed("old", 900, 1, age=3600)
+        new_quiet = self._feed("new", 10, 1, age=10)
+        self.assertEqual(
+            [item["photo"]["id"] for item in _sort_ks_search_items(
+                [old_popular, new_quiet], "latest")], ["new", "old"])
+        self.assertEqual(
+            [item["photo"]["id"] for item in _sort_ks_search_items(
+                [new_quiet, old_popular], "most_liked")], ["old", "new"])
+
+
+class ChannelsAccountCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.previous_engine = db._engine
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db.init_db(str(Path(self.temp_dir.name) / "channels-collection.db"))
+        with db.get_session() as session:
+            account = DouyinAccount(
+                platform="shipinhao", nickname="视频号作者", sec_uid="finder-owner",
+                status="active",
+                storage_state='{"cookies":[{"name":"_finder_auth","value":"fixture"}]}',
+            )
+            session.add(account); session.commit(); session.refresh(account)
+            job = KeywordCollectionJob(
+                platform="shipinhao", account_id=account.id,
+                source_type="account_works", source_name="本账号作品", keywords="[]",
+                max_contents_per_keyword=2, max_pages_per_keyword=4,
+                content_type="all", min_likes=100, min_comments=1,
+                max_comments_per_content=3, include_replies=True, download_media=True,
+            )
+            session.add(job); session.commit(); session.refresh(job)
+            self.account = SimpleNamespace(
+                id=account.id, platform="shipinhao", nickname=account.nickname,
+                sec_uid=account.sec_uid, storage_state=account.storage_state, proxy="")
+            self.job_id = job.id
+        self.identity = SimpleNamespace(ua="fixture-agent")
+        self.browser = SimpleNamespace(identity_for=lambda _account: self.identity)
+        self.collector = KeywordCollector(Config(), self.browser, SimpleNamespace())
+
+    async def asyncTearDown(self):
+        if db._engine is not None:
+            db._engine.dispose()
+        db._engine = self.previous_engine
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _work(object_id: str, likes: int, comments: int, media_type: int):
+        return {
+            "objectId": object_id, "createTime": int(__import__("time").time()),
+            "likeCount": likes, "commentCount": comments,
+            "desc": {
+                "description": object_id, "mediaType": media_type,
+                "media": [{"mediaType": media_type, "thumbUrl": f"https://media.test/{object_id}.jpg"}],
+            },
+        }
+
+    async def test_account_works_persist_video_photo_comments_and_metadata_only_media(self):
+        self.collector._discover_channels_account = AsyncMock(return_value=([
+            self._work("below-threshold", 10, 3, 2),
+            self._work("video-work", 500, 2, 1),
+            self._work("photo-work", 300, 1, 2),
+        ], ""))
+        self.collector._channels_comments = AsyncMock(side_effect=[([
+            {"comment_id": "root", "text": "根评论", "user_nickname": "甲",
+             "user_sec_uid": "finder-a", "like_count": 2, "create_time": 100,
+             "reply_to": ""},
+            {"comment_id": "reply", "text": "回复", "user_nickname": "乙",
+             "user_sec_uid": "finder-b", "like_count": 1, "create_time": 101,
+             "reply_to": "root"},
+        ], ""), ([], "")])
+
+        with patch("app.engine.collection.asyncio.sleep", new=AsyncMock()):
+            result = await self.collector.run(self.job_id, self.account)
+
+        self.assertEqual(result["contents"], 2)
+        self.assertEqual(result["comments"], 2)
+        self.collector._discover_channels_account.assert_awaited_once()
+        self.assertIs(
+            self.collector._discover_channels_account.await_args.args[0], self.identity)
+        self.assertEqual(
+            self.collector._discover_channels_account.await_args.args[1].id, self.job_id)
+        self.assertEqual(self.collector._channels_comments.await_count, 2)
+        with db.get_session() as session:
+            rows = session.exec(select(KeywordCollectionContent).order_by(
+                KeywordCollectionContent.id)).all()
+            comments = session.exec(select(KeywordCollectionComment).order_by(
+                KeywordCollectionComment.id)).all()
+        self.assertEqual([row.aweme_id for row in rows], ["video-work", "photo-work"])
+        self.assertEqual([row.media_type for row in rows], ["video", "images"])
+        self.assertTrue(all(row.download_status == "skipped" for row in rows))
+        self.assertTrue(all("仅保存作品元数据" in row.error for row in rows))
+        self.assertTrue(all(row.author_name == "视频号作者" for row in rows))
+        self.assertTrue(all(row.author_id == "finder-owner" for row in rows))
+        self.assertEqual({row.user_sec_uid for row in comments}, {"finder-a", "finder-b"})
+        self.assertEqual(
+            _collection_content_dict(rows[0])["url"],
+            "https://channels.weixin.qq.com/platform/post/list")
 
 
 class KeywordCollectionMediaPreviewTests(unittest.TestCase):

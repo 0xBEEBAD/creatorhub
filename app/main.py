@@ -6689,7 +6689,7 @@ def _meta_matches(item: MonitorTarget | CommentWatch, group_name: str, tag: str)
     return True
 
 
-# ─────────── 抖音 / 小红书关键词批量采集 ───────────
+# ─────────── 抖音 / 小红书 / 快手 / 视频号批量采集 ───────────
 class KeywordCollectionIn(BaseModel):
     platform: str = "douyin"
     account_id: int
@@ -6716,15 +6716,24 @@ def _validated_collection_input(body: KeywordCollectionIn) \
         -> tuple[str, list[str], str, str, dict]:
     """校验创建/编辑共用的任务配置并返回规范化值。"""
     platform = body.platform.strip().lower()
-    if platform not in {"douyin", "xhs"}:
-        raise HTTPException(400, "关键词批量采集仅支持抖音或小红书")
+    if platform not in {"douyin", "xhs", "kuaishou", "shipinhao"}:
+        raise HTTPException(400, "批量采集仅支持抖音、小红书、快手或视频号")
     source_type = body.source_type.strip().lower() or "keyword"
-    if source_type not in {"keyword", "favorite_all", "favorite_board", "creator"}:
-        raise HTTPException(400, "采集来源须为关键词、创作者主页、全部收藏或指定收藏夹")
+    if source_type not in {
+            "keyword", "favorite_all", "favorite_board", "creator",
+            "account_works"}:
+        raise HTTPException(400, "采集来源须为关键词、创作者主页、全部收藏、指定收藏夹或本账号作品")
+    if platform == "shipinhao" and source_type != "account_works":
+        raise HTTPException(400, "视频号批量采集仅支持当前登录账号的本账号作品")
+    if platform != "shipinhao" and source_type == "account_works":
+        raise HTTPException(400, "本账号作品来源仅支持视频号")
     if source_type in {"favorite_all", "favorite_board"} and platform != "xhs":
         raise HTTPException(400, "收藏来源仅支持小红书")
     source_ref = body.source_ref.strip()
     source_name = body.source_name.strip()
+    if source_type == "account_works":
+        source_ref = ""
+        source_name = "本账号作品"
     if source_type == "favorite_board" and not source_ref:
         raise HTTPException(400, "指定收藏夹采集必须提供收藏夹 ID")
     if source_type == "creator" and not source_ref:
@@ -6743,6 +6752,7 @@ def _validated_collection_input(body: KeywordCollectionIn) \
         keywords = []
         source_name = source_name or ("全部收藏" if source_type == "favorite_all" else
                                       "收藏夹" if source_type == "favorite_board" else
+                                      "本账号作品" if source_type == "account_works" else
                                       f"创作者 {source_ref}")
     if not 1 <= body.max_contents_per_keyword <= 100:
         raise HTTPException(400, "每个关键词作品数须为 1~100")
@@ -6959,6 +6969,10 @@ def _collection_content_dict(row: KeywordCollectionContent) -> dict:
         url = f"https://www.xiaohongshu.com/explore/{row.aweme_id}"
         if query:
             url += "?" + query
+    elif row.platform == "kuaishou":
+        url = f"https://www.kuaishou.com/short-video/{row.aweme_id}"
+    elif row.platform == "shipinhao":
+        url = "https://channels.weixin.qq.com/platform/post/list"
     else:
         url = f"https://www.douyin.com/video/{row.aweme_id}"
     local_files = _collection_local_media_paths(row)
@@ -7181,7 +7195,7 @@ async def list_keyword_collections(platform: str | None = None, limit: int = 100
     limit = max(1, min(limit, 300))
     with get_session() as session:
         stmt = select(KeywordCollectionJob)
-        if platform in {"douyin", "xhs"}:
+        if platform in {"douyin", "xhs", "kuaishou", "shipinhao"}:
             stmt = stmt.where(KeywordCollectionJob.platform == platform)
         rows = session.exec(
             stmt.order_by(KeywordCollectionJob.created_at.desc()).limit(limit)).all()

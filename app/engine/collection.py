@@ -1,4 +1,4 @@
-"""抖音 / 小红书关键词批量采集流水线。"""
+"""抖音 / 小红书 / 快手 / 视频号批量采集流水线。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,12 @@ from sqlmodel import select
 
 from ..browser import (
     fetch_comments,
+    fetch_channels_comments,
+    fetch_channels_works,
     fetch_douyin_search,
+    fetch_ks_comments,
+    fetch_ks_search,
+    fetch_ks_videos,
     fetch_videos,
     fetch_xhs_comments,
     fetch_xhs_favorites,
@@ -35,6 +40,16 @@ from ..platforms.douyin import (
     safe_title,
 )
 from ..platforms.douyin.extract import Aweme
+from ..platforms.kuaishou import (
+    flatten_ks_comments,
+    parse_ks_comment,
+    parse_ks_feed,
+)
+from ..platforms.channels import (
+    flatten_channels_comments,
+    parse_channels_comment,
+    parse_channels_feed,
+)
 from ..platforms.xhs import (
     XhsApiClient,
     cookie_str_from_state,
@@ -68,6 +83,15 @@ def _author_id(raw: dict, platform: str) -> str:
     if platform == "douyin":
         author = raw.get("author") or {}
         return str(author.get("sec_uid") or author.get("uid") or "")
+    if platform == "kuaishou":
+        photo = raw.get("photo") or {}
+        author = raw.get("author") or photo.get("author") or {}
+        return str(author.get("id") or author.get("userId")
+                   or author.get("user_id") or author.get("eid") or "")
+    if platform == "shipinhao":
+        author = raw.get("author") or raw.get("finderUser") or {}
+        return str(author.get("username") or author.get("finderUsername")
+                   or raw.get("username") or raw.get("finderUsername") or "")
     card = raw.get("note_card") or raw
     user = card.get("user") or {}
     return str(user.get("user_id") or user.get("userid") or user.get("id") or "")
@@ -115,8 +139,24 @@ def _sort_xhs_search_items(items: list[dict], search_sort: str) -> list[dict]:
     return list(items)
 
 
-def _xhs_content_matches(aweme: Aweme, job: KeywordCollectionJob,
-                         *, now: int | None = None) -> bool:
+def _sort_ks_search_items(items: list[dict], search_sort: str) -> list[dict]:
+    """快手搜索排序参数不稳定，按响应字段在本地保持确定性。"""
+    if search_sort not in {"latest", "most_liked"}:
+        return list(items)
+
+    def sort_value(item: dict) -> int:
+        photo = item.get("photo") or item
+        if search_sort == "latest":
+            value = photo.get("timestamp") or photo.get("createTime") or 0
+        else:
+            value = photo.get("realLikeCount") or photo.get("likeCount") or 0
+        return _xhs_count(value)
+
+    return sorted(items, key=sort_value, reverse=True)
+
+
+def _collection_content_matches(aweme: Aweme, job: KeywordCollectionJob,
+                                *, now: int | None = None) -> bool:
     if job.content_type != "all" and aweme.media_type != job.content_type:
         return False
     if aweme.like_count < max(0, int(job.min_likes or 0)):
@@ -128,6 +168,12 @@ def _xhs_content_matches(aweme: Aweme, job: KeywordCollectionJob,
         if aweme.create_time < int(now or time.time()) - window:
             return False
     return True
+
+
+def _xhs_content_matches(aweme: Aweme, job: KeywordCollectionJob,
+                         *, now: int | None = None) -> bool:
+    """保留既有测试/调用名；筛选规则同样适用于已归一化的快手作品。"""
+    return _collection_content_matches(aweme, job, now=now)
 
 
 class KeywordCollector:
@@ -330,6 +376,41 @@ class KeywordCollector:
             max_scrolls=job.max_pages_per_keyword,
             block_media=self.cfg.engine.block_media_resources)
         return values[:job.max_contents_per_keyword], error
+
+    async def _discover_ks(self, account, keyword: str,
+                           job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        return await fetch_ks_search(
+            self.browser,
+            self.browser.identity_for(account),
+            keyword,
+            set(),
+            max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+            stagnant_limit=max(1, min(8, int(job.stagnant_pages or 1))),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+
+    async def _discover_ks_creator(
+            self, account, job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        values, _author, error = await fetch_ks_videos(
+            self.browser,
+            self.browser.identity_for(account),
+            job.source_ref,
+            set(),
+            max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        return values[:job.max_contents_per_keyword], error
+
+    async def _discover_channels_account(
+            self, identity, job: KeywordCollectionJob) -> tuple[list[dict], str]:
+        values, _author, error = await fetch_channels_works(
+            self.browser,
+            identity,
+            set(),
+            max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        return values, error
 
     async def _discover_xhs(self, client: XhsApiClient, keyword: str,
                             job: KeywordCollectionJob) -> tuple[list[dict], str]:
@@ -544,6 +625,10 @@ class KeywordCollector:
             row.error = detail_error
             if job.download_media and aweme.medias and row.download_status != "done":
                 row.download_status = "pending"
+            elif (job.download_media and not aweme.medias
+                  and job.platform == "shipinhao"):
+                row.download_status = "skipped"
+                row.error = detail_error or "视频号未提供可直接下载媒体，仅保存作品元数据"
             elif job.download_media and not aweme.medias:
                 row.download_status = "failed"
                 row.error = detail_error or "未取得媒体地址"
@@ -682,6 +767,44 @@ class KeywordCollector:
             parsed = [item for item in parsed if not item.get("reply_to")]
         return self._dedupe_comments(parsed, limit), error
 
+    async def _ks_comments(self, identity, photo_id: str, limit: int,
+                           include_replies: bool) -> tuple[list[dict], str]:
+        if limit <= 0:
+            return [], ""
+        raw, error = await fetch_ks_comments(
+            self.browser,
+            identity,
+            photo_id,
+            set(),
+            max_scrolls=max(1, min(20, math.ceil(limit / 10) + 1)),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        values = flatten_ks_comments(raw) if include_replies else raw
+        parsed = [item for item in
+                  (parse_ks_comment(value) for value in values) if item]
+        if not include_replies:
+            parsed = [item for item in parsed if not item.get("reply_to")]
+        return self._dedupe_comments(parsed, limit), error
+
+    async def _channels_comments(self, identity, object_id: str, limit: int,
+                                 include_replies: bool) -> tuple[list[dict], str]:
+        if limit <= 0:
+            return [], ""
+        raw, error = await fetch_channels_comments(
+            self.browser,
+            identity,
+            object_id,
+            set(),
+            max_scrolls=max(1, min(20, math.ceil(limit / 10) + 1)),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        values = flatten_channels_comments(raw) if include_replies else raw
+        parsed = [item for item in
+                  (parse_channels_comment(value) for value in values) if item]
+        if not include_replies:
+            parsed = [item for item in parsed if not item.get("reply_to")]
+        return self._dedupe_comments(parsed, limit), error
+
     @staticmethod
     def _dedupe_comments(values: list[dict], limit: int) -> list[dict]:
         found: dict[str, dict] = {}
@@ -732,9 +855,11 @@ class KeywordCollector:
         if not job:
             raise RuntimeError("采集任务不存在")
         keywords = _loads_keywords(job.keywords)
-        if job.source_type in {"favorite_all", "favorite_board", "creator"}:
+        if job.source_type in {
+                "favorite_all", "favorite_board", "creator", "account_works"}:
             default_name = ("全部收藏" if job.source_type == "favorite_all" else
                             "收藏夹" if job.source_type == "favorite_board" else
+                            "本账号作品" if job.source_type == "account_works" else
                             f"创作者 {job.source_ref}")
             keywords = [job.source_name or default_name]
         if not keywords:
@@ -750,7 +875,7 @@ class KeywordCollector:
                 timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy,
                 storage_state=account.storage_state,
                 **douyin_client_environment(identity))
-        elif not self._xhs_browser_reads_enabled():
+        elif job.platform == "xhs" and not self._xhs_browser_reads_enabled():
             cookie = cookie_str_from_state(account.storage_state)
             if not has_a1(cookie):
                 raise RuntimeError("小红书登录态缺少 a1，请重新扫码登录")
@@ -783,6 +908,12 @@ class KeywordCollector:
                 return await self._run_keywords(
                     job_id, job, account, keywords, proxy,
                     douyin_client=douyin_client, context=context)
+        if job.platform == "kuaishou":
+            return await self._run_keywords(
+                job_id, job, account, keywords, proxy, identity=identity)
+        if job.platform == "shipinhao":
+            return await self._run_keywords(
+                job_id, job, account, keywords, proxy, identity=identity)
         if xhs_client is not None:
             async with xhs_client.session_scope():
                 return await self._run_keywords(
@@ -815,10 +946,12 @@ class KeywordCollector:
             elif job.platform == "xhs" and keyword_index:
                 await self._xhs_gap(
                     self.cfg.engine.xhs_keyword_gap_seconds)
+            elif job.platform == "kuaishou" and keyword_index:
+                await asyncio.sleep(0.8 * random.uniform(1.0, 1.35))
             self._progress(
                 job_id,
                 keyword=keyword,
-                step="搜索作品",
+                step=("同步本账号作品" if job.platform == "shipinhao" else "搜索作品"),
                 processed_keyword_count=keyword_index,
                 current_item_index=0,
                 current_item_total=0,
@@ -831,6 +964,16 @@ class KeywordCollector:
                     raw_items, search_error = await self._discover_douyin(
                         account, keyword, job, client=douyin_client,
                         context=context)
+            elif job.platform == "kuaishou":
+                if job.source_type == "creator":
+                    raw_items, search_error = await self._discover_ks_creator(
+                        account, job)
+                else:
+                    raw_items, search_error = await self._discover_ks(
+                        account, keyword, job)
+            elif job.platform == "shipinhao":
+                raw_items, search_error = await self._discover_channels_account(
+                    identity, job)
             elif browser_reads:
                 if job.source_type in {"favorite_all", "favorite_board"}:
                     raw_items, search_error = await self._discover_xhs_favorites_browser(
@@ -869,6 +1012,9 @@ class KeywordCollector:
                 )
                 continue
 
+            if job.platform == "kuaishou":
+                raw_items = _sort_ks_search_items(raw_items, job.search_sort)
+
             candidates = (raw_items[:job.max_contents_per_keyword]
                           if job.platform == "douyin" else raw_items)
             accepted = 0
@@ -899,6 +1045,14 @@ class KeywordCollector:
                             media_type="images" if raw.get("images") else "video",
                         )
                         detail_error = "未取得媒体地址"
+                    token = ""
+                elif job.platform == "kuaishou":
+                    aweme = parse_ks_feed(raw, job.video_quality or "highest")
+                    token = ""
+                elif job.platform == "shipinhao":
+                    aweme = parse_channels_feed(raw, job.video_quality or "highest")
+                    if aweme is not None and not aweme.author_name:
+                        aweme.author_name = str(getattr(account, "nickname", "") or "")
                     token = ""
                 elif browser_reads:
                     aweme, parts, detail_error = \
@@ -932,12 +1086,16 @@ class KeywordCollector:
                 if aweme is None:
                     self._record_error(job_id, f"{keyword}: 无法解析一条搜索结果")
                     continue
-                if job.platform == "xhs" and not _xhs_content_matches(aweme, job):
+                if job.platform in {"xhs", "kuaishou", "shipinhao"} and not \
+                        _collection_content_matches(aweme, job):
                     continue
 
                 current = self._job(job_id)
+                author_id = _author_id(detail_raw, job.platform)
+                if job.platform == "shipinhao" and not author_id:
+                    author_id = str(getattr(account, "sec_uid", "") or "")
                 content = self._upsert_content(
-                    current, keyword, aweme, _author_id(detail_raw, job.platform),
+                    current, keyword, aweme, author_id,
                     token, source, detail_error)
                 accepted += 1
                 if detail_error:
@@ -949,13 +1107,25 @@ class KeywordCollector:
                     self._progress(job_id, keyword=keyword, step=f"下载作品 {index}")
                     await self._download(current, content, aweme, proxy)
 
-                if job.max_comments_per_content > 0:
+                should_collect_comments = (
+                    job.max_comments_per_content > 0
+                    and (job.platform != "shipinhao" or aweme.comment_count > 0)
+                )
+                if should_collect_comments:
                     self._progress(job_id, keyword=keyword, step=f"抓取评论 {index}")
                     if job.platform == "douyin":
                         comments, comment_error = await self._douyin_comments(
                             account, douyin_client, aweme,
                             job.max_comments_per_content, job.include_replies,
                             context=context)
+                    elif job.platform == "kuaishou":
+                        comments, comment_error = await self._ks_comments(
+                            identity, aweme.aweme_id,
+                            job.max_comments_per_content, job.include_replies)
+                    elif job.platform == "shipinhao":
+                        comments, comment_error = await self._channels_comments(
+                            identity, aweme.aweme_id,
+                            job.max_comments_per_content, job.include_replies)
                     elif browser_reads:
                         comments, comment_error = await self._xhs_comments_browser(
                             identity, aweme.aweme_id, token, source,
@@ -969,7 +1139,7 @@ class KeywordCollector:
                     if comment_error:
                         self._record_error(
                             job_id, f"{keyword}/{aweme.aweme_id}: {comment_error}")
-                        if job.platform == "xhs" and classify_platform_error(
+                        if job.platform in {"xhs", "kuaishou", "shipinhao"} and classify_platform_error(
                                 comment_error)[0] in {
                                 RiskCategory.RISK, RiskCategory.AUTH,
                                 RiskCategory.NETWORK}:

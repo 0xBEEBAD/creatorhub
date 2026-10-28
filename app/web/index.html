@@ -1831,7 +1831,7 @@
     <button class="navitem" data-tab="overview" onclick="switchTab('overview', true)"><svg><use href="#i-overview"/></svg><span class="nav-label">工作概览</span></button>
     <button class="navitem" data-tab="accounts" onclick="switchTab('accounts', true)"><svg><use href="#i-card"/></svg><span class="nav-label">平台账号</span><span class="nav-badge" id="tb-acc">0</span></button>
     <button class="navitem notsh-only" data-tab="monitors" onclick="switchTab('monitors', true)"><svg><use href="#i-target"/></svg><span class="nav-label">作品监控</span><span class="nav-badge" id="tb-mon">0</span></button>
-    <button class="navitem collect-only" data-tab="collections" onclick="switchTab('collections', true)"><svg><use href="#i-hash"/></svg><span class="nav-label">关键词采集</span><span class="nav-badge" id="tb-col">0</span></button>
+    <button class="navitem collect-only" data-tab="collections" onclick="switchTab('collections', true)"><svg><use href="#i-hash"/></svg><span class="nav-label" id="nav-collections-label">关键词采集</span><span class="nav-badge" id="tb-col">0</span></button>
     <button class="navitem notsh-only" data-tab="comments" onclick="switchTab('comments', true)"><svg><use href="#i-msg"/></svg><span class="nav-label">评论监控</span><span class="nav-badge" id="tb-watch">0</span></button>
     <button class="navitem dy-only" data-tab="danmaku" onclick="switchTab('danmaku', true)"><svg><use href="#i-captions"/></svg><span class="nav-label">弹幕监控</span><span class="nav-badge" id="tb-danmaku">0</span></button>
     <div class="nav-sep">本账号</div>
@@ -2167,9 +2167,9 @@
       </div>
       <div class="stack">
         <div class="form-grid cols-4">
-          <div class="form-field"><label for="col-source">采集来源</label><select id="col-source" onchange="collectionSourceChanged()"><option value="keyword">关键词搜索</option><option value="creator">创作者主页</option><option value="favorite_all" data-xhs-source>全部收藏</option><option value="favorite_board" data-xhs-source>指定收藏夹</option></select></div>
+          <div class="form-field"><label for="col-source">采集来源</label><select id="col-source" onchange="collectionSourceChanged()"><option value="keyword">关键词搜索</option><option value="creator">创作者主页</option><option value="favorite_all" data-xhs-source>全部收藏</option><option value="favorite_board" data-xhs-source>指定收藏夹</option><option value="account_works" data-channels-source>本账号作品</option></select></div>
           <div class="form-field xhs-only" id="col-board-wrap" style="display:none"><label for="col-board">收藏夹</label><select id="col-board"><option value="">先选择账号并加载</option></select><p class="hint" id="col-board-help"></p></div>
-          <div class="form-field" id="col-source-ref-wrap" style="display:none"><label for="col-source-ref">创作者用户 ID</label><input id="col-source-ref" placeholder="抖音 sec_uid / 小红书 user_id"><p class="hint">使用公开主页作品列表，评论和下载继续沿用下方设置。</p></div>
+          <div class="form-field" id="col-source-ref-wrap" style="display:none"><label for="col-source-ref">创作者用户 ID</label><input id="col-source-ref" placeholder="抖音 sec_uid / 小红书 user_id / 快手 3x ID"><p class="hint">使用公开主页作品列表，评论和下载继续沿用下方设置。</p></div>
         </div>
         <div class="form-field" id="col-keywords-wrap">
           <label for="col-keywords">关键词 <span class="field-scope">必填 · 最多 20 个</span></label>
@@ -2178,13 +2178,13 @@
         </div>
         <div class="form-grid cols-4">
           <div class="form-field"><label for="col-account">使用账号</label><select id="col-account" required onchange="collectionAccountChanged()"></select></div>
-          <div class="form-field"><label for="col-content-limit">每词作品上限</label><input id="col-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
+          <div class="form-field"><label for="col-content-limit" id="col-content-limit-label">每词作品上限</label><input id="col-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
           <div class="form-field"><label for="col-comment-limit">每作品评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
           <div class="form-field dy-only"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
         </div>
         <div class="form-grid cols-4 collection-filter-grid" aria-label="搜索深度与排序">
-          <div class="form-field"><label for="col-page-limit">每词采集深度 <span class="field-scope">1–40 页</span></label><input id="col-page-limit" type="number" min="1" max="40" value="12" inputmode="numeric"><p class="hint" id="col-page-help">一页对应一次搜索结果下滑。</p></div>
-          <div class="form-field"><label for="col-sort">搜索排序</label><select id="col-sort"><option value="general">综合排序</option><option value="latest">最新发布</option><option value="most_liked">最多点赞</option></select></div>
+          <div class="form-field"><label for="col-page-limit" id="col-page-limit-label">每词采集深度 <span class="field-scope">1–40 页</span></label><input id="col-page-limit" type="number" min="1" max="40" value="12" inputmode="numeric"><p class="hint" id="col-page-help">一页对应一次搜索结果下滑。</p></div>
+          <div class="form-field" id="col-sort-wrap"><label for="col-sort">搜索排序</label><select id="col-sort"><option value="general">综合排序</option><option value="latest">最新发布</option><option value="most_liked">最多点赞</option></select></div>
           <div class="form-field"><label for="col-publish-time">发布时间</label><select id="col-publish-time"><option value="all">不限</option><option value="day">一天内</option><option value="week">一周内</option><option value="half_year">半年内</option></select></div>
           <div class="form-field"><label for="col-content-type">内容类型</label><select id="col-content-type"><option value="all">全部作品</option><option value="video">视频</option><option value="images">图文 / 图集</option></select></div>
         </div>
@@ -2623,9 +2623,9 @@
           <div class="form-field">
             <label for="engine-xhs_read_mode">小红书作品获取方式</label>
             <select id="engine-xhs_read_mode" name="xhs_read_mode" disabled aria-describedby="engine-xhs-read-help">
-              <option value="browser">浏览器获取（推荐）</option><option value="api">API 直连（兼容模式）</option>
+              <option value="api">API 直连（兼容模式）</option><option value="browser">浏览器获取</option>
             </select>
-            <p class="field-help" id="engine-xhs-read-help">浏览器获取兼容性更好；API 直连不会打开页面。</p>
+            <p class="field-help" id="engine-xhs-read-help">默认使用 API 直连且不会打开页面；需要页面兼容时可切换为浏览器获取。</p>
           </div>
           <div class="form-field">
             <label for="engine-douyin_read_mode">抖音读取方式</label>

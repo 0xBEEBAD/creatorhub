@@ -58,9 +58,8 @@ class EngineConfig:
     resident_browser_sessions: bool = True
     browser_session_idle_seconds: int = 1800
     xhs_cdp_idle_seconds: int | None = None
-    # 小红书读取默认也走账号浏览器页面，避免扫码 Cookie 在浏览器与签名直连
-    # 客户端之间切换 UA/TLS/Client-Hints。api 只保留为显式兼容模式。
-    xhs_read_mode: str = "browser"           # browser | api
+    # 小红书读取默认使用常驻签名客户端直连；browser 保留为页面兼容模式。
+    xhs_read_mode: str = "api"               # api | browser
     douyin_read_mode: str = "hybrid"         # 默认 API 优先/浏览器回退；api=仅 API；browser=仅浏览器
     # 本账号管理中的独立读取通道。资料与粉丝已支持直连；其余三项保留
     # 独立开关，待协议完整可验证后无需再迁移配置。
@@ -201,10 +200,10 @@ def load_config(path: str | None = None) -> Config:
         if cfg.engine.xhs_browser_mode == "playwright":
             cfg.engine.xhs_browser_mode = "patchright"
         xhs_read_mode = str(
-            cfg.engine.xhs_read_mode or "browser").strip().lower()
+            cfg.engine.xhs_read_mode or "api").strip().lower()
         cfg.engine.xhs_read_mode = (
             xhs_read_mode if xhs_read_mode in {"browser", "api"}
-            else "browser")
+            else "api")
         for name, default in (
                 ("douyin_read_mode", "hybrid"),
                 ("douyin_profile_mode", "hybrid"),

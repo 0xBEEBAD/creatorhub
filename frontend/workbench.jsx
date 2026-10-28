@@ -25,14 +25,15 @@ document.querySelectorAll("main > [data-panel]").forEach(panel => {
 
 const composerSpecs = {
   monitors: ["t-url", "新建作品监控", "粘贴目标，选择账号与采集策略。"],
-  collections: ["col-keywords", "新建关键词采集", "设置关键词与采集上限，提交后在列表查看进度。"],
+  collections: ["col-keywords", "新建作品采集", "设置来源与采集上限，提交后在列表查看进度。"],
   comments: ["w-url", "新建评论监控", "选择作品或账号，持续收集评论。"],
   danmaku: ["d-w-url", "新建弹幕监控", "保留弹幕时间点，分别设置来源与采集范围。"],
   autocomment: ["ac-templates", "新建评论规则", "规则默认关闭，先试跑、检查文案，再手动启用。"],
   notifications: ["n-name", "添加通知渠道", "配置推送渠道，添加后可发送测试通知。"],
 };
 const composerTitle = (key, platform) => key === "collections"
-  ? `新建${platform === "xhs" ? "小红书" : "抖音"}关键词采集`
+  ? platform === "shipinhao" ? "新建视频号本账号作品采集"
+    : `新建${({ douyin: "抖音", xhs: "小红书", kuaishou: "快手" })[platform] || "平台"}关键词采集`
   : composerSpecs[key]?.[1] || "新建任务";
 // Notifications previously mixed configuration and saved objects in one card.
 const notificationCard = $("n-name").closest(".card");

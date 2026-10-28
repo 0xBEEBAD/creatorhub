@@ -23,7 +23,7 @@ class TaskSubmission(SQLModel, table=True):
 class DouyinAccount(SQLModel, table=True):
     """登录得到的平台账号(浏览器会话持有者)。表名沿用历史,实际承载多平台账号。"""
     id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str = Field(default="douyin", index=True)  # douyin | xhs
+    platform: str = Field(default="douyin", index=True)  # douyin | xhs | kuaishou | shipinhao
     nickname: str = ""
     sec_uid: str = ""              # 抖音 sec_uid / 小红书 user_id
     uid: str = ""                  # 抖音数字 uid(= IM device_id,用于 frontier-im WS 接收)
@@ -353,9 +353,9 @@ class CommentRecord(SQLModel, table=True):
 class KeywordCollectionJob(SQLModel, table=True):
     """一次性的关键词批量采集任务。与持续轮询的 MonitorTarget 分开建模。"""
     id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str = Field(default="douyin", index=True)  # douyin | xhs
+    platform: str = Field(default="douyin", index=True)  # douyin | xhs | kuaishou | shipinhao
     account_id: int = Field(index=True)
-    source_type: str = Field(default="keyword", index=True)  # keyword | creator | favorite_all | favorite_board
+    source_type: str = Field(default="keyword", index=True)  # keyword | creator | favorite_all | favorite_board | account_works
     source_ref: str = ""              # 收藏夹 id 等平台来源标识
     source_name: str = ""             # 面向用户的来源名称
     keywords: str = "[]"                 # JSON 字符串数组
@@ -399,7 +399,7 @@ class KeywordCollectionContent(SQLModel, table=True):
     job_id: int = Field(index=True)
     platform: str = Field(default="douyin", index=True)
     keyword: str = Field(default="", index=True)
-    aweme_id: str = Field(index=True)       # 抖音 aweme_id / 小红书 note_id
+    aweme_id: str = Field(index=True)       # 抖音 aweme_id / 小红书 note_id / 快手 photo_id / 视频号 object_id
     desc: str = ""
     author_name: str = ""
     author_id: str = ""

@@ -124,6 +124,8 @@ def parse_channels_comment(raw: dict) -> Optional[dict]:
         "comment_id": cid,
         "text": (_first(raw, "content", "text", "commentContent", default="") or "").strip(),
         "user_nickname": _first(raw, "nickname", "userName", "author_name", default="") or "",
+        "user_sec_uid": str(_first(
+            raw, "username", "finderUsername", "userId", "user_id", default="") or ""),
         "like_count": _to_int(_first(raw, "likeCount", "like_count", default=0)),
         "create_time": create_time,
         "reply_to": str(_first(raw, "replyCommentId", "reply_to", "rootCommentId",

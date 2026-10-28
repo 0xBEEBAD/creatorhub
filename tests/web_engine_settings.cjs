@@ -86,16 +86,16 @@ function fixture(initial = {}) {
   assert.equal(f.byName.scan_interval_seconds.value, '300');
   assert.equal(f.protectedUnload(), false);
   await f.api.save(); assert.equal(f.writes().length, 0);
-  f.edit('xhs_read_mode', 'api'); f.edit('douyin_read_mode', 'api');
+  f.edit('xhs_read_mode', 'browser'); f.edit('douyin_read_mode', 'api');
   f.edit('douyin_profile_mode', 'api'); f.edit('douyin_followers_mode', 'browser');
   f.edit('douyin_keyword_gap_seconds', '12.5'); f.edit('danmaku_recent_works', '6');
   f.edit('route_download_via_proxy', false); f.edit('work_health_interval_seconds', '5400');
   f.edit('xhs_comment_review_before_publish', false);
   assert(f.api.isDirty() && f.protectedUnload());
-  await f.api.load(); assert.equal(f.byName.xhs_read_mode.value, 'api', 'background refresh must preserve draft');
+  await f.api.load(); assert.equal(f.byName.xhs_read_mode.value, 'browser', 'background refresh must preserve draft');
   await f.api.save();
   assert.deepEqual(JSON.parse(f.writes()[0].init.body), {
-    xhs_read_mode: 'api', douyin_read_mode: 'api', douyin_profile_mode: 'api',
+    xhs_read_mode: 'browser', douyin_read_mode: 'api', douyin_profile_mode: 'api',
     douyin_followers_mode: 'browser', douyin_keyword_gap_seconds: 12.5,
     danmaku_recent_works: 6, route_download_via_proxy: false,
     work_health_interval_seconds: 5400, xhs_comment_review_before_publish: false,
@@ -104,7 +104,7 @@ function fixture(initial = {}) {
   f.api.defaults();
   assert.equal(f.writes().length, 1, 'recommended values only fill the draft');
   assert(f.api.isDirty());
-  await f.api.save(); assert.equal(f.state.values.xhs_read_mode, 'browser');
+  await f.api.save(); assert.equal(f.state.values.xhs_read_mode, 'api');
 
   for (const [key, value] of [['comment_recent_days', ''], ['comment_recent_days', '0'],
     ['comment_recent_days', '1.5'], ['xhs_request_jitter', '1.1'], ['request_timeout_seconds', 'NaN'],
@@ -161,7 +161,7 @@ function fixture(initial = {}) {
     await fine.api.load(); assert.equal(fine.byName.scan_interval_seconds.value, String(seconds));
     assert(!fine.api.isDirty());
   }
-  const manual = fixture({ comment_recent_works: 1000, work_health_interval_seconds: 962,
+  const manual = fixture({ xhs_read_mode: 'browser', comment_recent_works: 1000, work_health_interval_seconds: 962,
     native_write_proxy_max_age_seconds: 7201 }); await manual.api.load();
   assert.equal(manual.byName.work_health_interval_seconds.value, '962');
   manual.edit('xhs_read_mode', 'api'); await manual.api.save();

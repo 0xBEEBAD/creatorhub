@@ -1057,7 +1057,7 @@ const PAGE_META = {
     title: "作品监控", desc: "追踪关注的创作者，检查采集进度与新作品。"
   },
   collections: {
-    title: "关键词批量采集", desc: "批量搜索平台作品，并按上限采集评论与媒体。"
+    title: "批量作品采集", desc: "按平台支持的来源批量采集作品、评论与可用媒体。"
   },
   comments: {
     title: "评论监控", desc: "订阅作品或账号评论，按来源、分组和标签筛选。"
@@ -1158,7 +1158,7 @@ function applyPlatformUI() {
   document.querySelectorAll(".sh-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "shipinhao"));
   document.querySelectorAll(".notsh-only").forEach(e => e.classList.toggle("hidden", pfIsChannels(PLATFORM)));
   document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle(
-    "hidden", !["douyin", "xhs"].includes(PLATFORM)));
+    "hidden", !["douyin", "xhs", "kuaishou", "shipinhao"].includes(PLATFORM)));
   document.querySelectorAll(".meta-scope").forEach(e => {
     e.textContent = (PF_NAME[PLATFORM] || "当前平台") + "内独立";
   });
@@ -1223,7 +1223,7 @@ function applyPlatformUI() {
     // 视频号本账号只有「我的作品 / 数据」;若停在关注/粉丝/私信子页,切回我的作品
     if (["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
   }
-  if (!["douyin", "xhs"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
+  if (!["douyin", "xhs", "kuaishou", "shipinhao"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
   // 不支持发布的平台:若正停在该面板则回到总览(当前四平台均支持,兜底保留)
   if (!pfHasPublish(PLATFORM)) {
     const pub = document.querySelector('[data-panel="publish"]');
@@ -5213,8 +5213,13 @@ function applyCollectionForm() {
   const enabled = !!($("col-download") && $("col-download").checked);
   if ($("col-dir-wrap")) $("col-dir-wrap").style.display = enabled ? "" : "none";
   const xhs = PLATFORM === "xhs";
+  const channels = PLATFORM === "shipinhao";
+  const platformName = PF_NAME[PLATFORM] || "平台";
   document.querySelectorAll("#col-source [data-xhs-source]").forEach(option => { option.disabled = !xhs; option.hidden = !xhs; });
-  if (!xhs && ["favorite_all", "favorite_board"].includes(collectionSourceValue())) $("col-source").value = "keyword";
+  document.querySelectorAll("#col-source option:not([data-xhs-source]):not([data-channels-source])").forEach(option => { option.disabled = channels; option.hidden = channels; });
+  document.querySelectorAll("#col-source [data-channels-source]").forEach(option => { option.disabled = !channels; option.hidden = !channels; });
+  if (channels) $("col-source").value = "account_works";
+  else if (["favorite_all", "favorite_board", "account_works"].includes(collectionSourceValue())) $("col-source").value = "keyword";
   const source = collectionSourceValue();
   const favorite = ["favorite_all", "favorite_board"].includes(source);
   const alternate = source !== "keyword";
@@ -5222,20 +5227,30 @@ function applyCollectionForm() {
   if ($("col-board-wrap")) $("col-board-wrap").style.display = source === "favorite_board" ? "" : "none";
   if ($("col-source-ref-wrap")) $("col-source-ref-wrap").style.display = source === "creator" ? "" : "none";
   if ($("collection-create-title")) {
-    // Keep the keyword copy as a stable UI contract while exposing the new sources.
-    $("collection-create-title").textContent = favorite
-      ? `新建${xhs ? "小红书" : "抖音"}收藏采集`
+    $("collection-create-title").textContent = channels
+      ? "新建视频号本账号作品采集"
+      : favorite
+      ? `新建${platformName}收藏采集`
       : source === "creator"
-        ? `新建${xhs ? "小红书" : "抖音"}创作者采集`
-        : `新建${xhs ? "小红书" : "抖音"}关键词采集`;
+        ? `新建${platformName}创作者采集`
+        : `新建${platformName}关键词采集`;
   }
-  if ($("collection-create-sub")) $("collection-create-sub").textContent = favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : "批量搜索视频并抓取评论";
-  if ($("col-page-help")) $("col-page-help").textContent = xhs ? "一页对应一次搜索结果下滑或接口翻页。" : "一页对应一次搜索结果下滑。";
-  if ($("col-replies-help")) $("col-replies-help").textContent = `采集${xhs ? "小红书" : "抖音"}当前可返回的回复`;
-  if ($("collection-callout-title")) $("collection-callout-title").textContent = "作品上限、采集深度和停止条件任一满足即结束";
-  if ($("collection-callout-copy")) $("collection-callout-copy").textContent = xhs
+  if ($("collection-create-sub")) $("collection-create-sub").textContent = channels ? "同步当前登录账号的视频与图文，并按需采集评论" : favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : "批量搜索视频并抓取评论";
+  if ($("nav-collections-label")) $("nav-collections-label").textContent = channels ? "本账号作品采集" : "关键词采集";
+  if ($("col-content-limit-label")) $("col-content-limit-label").textContent = channels ? "作品上限" : "每词作品上限";
+  if ($("col-page-limit-label")) $("col-page-limit-label").innerHTML = channels ? '作品页采集深度 <span class="field-scope">1–40 页</span>' : '每词采集深度 <span class="field-scope">1–40 页</span>';
+  if ($("col-sort-wrap")) $("col-sort-wrap").style.display = channels ? "none" : "";
+  if ($("col-page-help")) $("col-page-help").textContent = channels ? "依次读取视频与图文管理页，滚动加载本账号作品。" : xhs ? "一页对应一次搜索结果下滑或接口翻页。" : "一页对应一次搜索结果下滑。";
+  if ($("col-source-ref")) $("col-source-ref").placeholder = PLATFORM === "douyin" ? "抖音 sec_uid" : PLATFORM === "xhs" ? "小红书 user_id" : "快手 user_id / 3x ID";
+  if ($("col-replies-help")) $("col-replies-help").textContent = `采集${platformName}当前可返回的回复`;
+  if ($("collection-callout-title")) $("collection-callout-title").textContent = channels ? "仅采集当前登录视频号账号自己的已发布作品" : "作品上限、采集深度和停止条件任一满足即结束";
+  if ($("collection-callout-copy")) $("collection-callout-copy").textContent = channels
+    ? "视频号助手会分别读取视频与图文管理页；作品元数据和统计可正常保存。若平台仅返回加密媒体，任务会保留元数据并跳过直接下载。评论入口如遇页面改版会在任务异常中明确记录。"
+    : xhs
     ? "小红书采集复用所选账号的可见浏览器或显式 API 读取模式；最新、类型、时间和数据门槛会在入库前复核；任务串行执行，可随时取消，已入库结果会保留。"
-    : "抖音采集会临时打开可见浏览器窗口；平台筛选后还会在本地复核类型、时间和数据门槛；任务串行执行，可随时取消，已入库结果会保留。";
+    : PLATFORM === "kuaishou"
+      ? "快手采集复用所选账号的登录浏览器，拦截页面签名后的搜索、主页和评论响应；类型、时间和数据门槛会在入库前复核。"
+      : "抖音采集会临时打开可见浏览器窗口；平台筛选后还会在本地复核类型、时间和数据门槛；任务串行执行，可随时取消，已入库结果会保留。";
 }
 function collectionStatus(status) {
   const labels = { pending: "等待中", running: "采集中", done: "已完成", partial: "部分完成", failed: "失败", canceled: "已取消" };
@@ -5253,10 +5268,10 @@ function collectionDate(value) {
 }
 async function createCollection() {
   const keywords = collectionKeywords();
-  const sourceType = collectionSourceValue();
+  const sourceType = PLATFORM === "shipinhao" ? "account_works" : collectionSourceValue();
   const board = $("col-board");
   const sourceRef = sourceType === "favorite_board" ? (board?.value || "") : sourceType === "creator" ? ($("col-source-ref")?.value.trim() || "") : "";
-  const sourceName = sourceType === "favorite_all" ? "全部收藏" : sourceType === "favorite_board" ? (board?.selectedOptions?.[0]?.textContent || "").replace(/（[\d,.万亿]+）$/, "") : sourceType === "creator" ? `创作者 ${sourceRef}` : "";
+  const sourceName = sourceType === "account_works" ? "本账号作品" : sourceType === "favorite_all" ? "全部收藏" : sourceType === "favorite_board" ? (board?.selectedOptions?.[0]?.textContent || "").replace(/（[\d,.万亿]+）$/, "") : sourceType === "creator" ? `创作者 ${sourceRef}` : "";
   const accountId = Number($("col-account").value || 0);
   const contentLimit = Number($("col-content-limit").value || 0);
   const commentLimit = Number($("col-comment-limit").value || 0);
@@ -5306,7 +5321,7 @@ async function createCollection() {
       });
       $("col-create-msg").textContent = `任务 #${job.id} 已进入队列`;
       if (sourceType === "keyword") $("col-keywords").value = "";
-      toast(`${sourceType === "keyword" ? "关键词" : sourceType === "creator" ? "创作者" : "收藏"}采集任务已创建`, "ok");
+      toast(`${sourceType === "account_works" ? "本账号作品" : sourceType === "keyword" ? "关键词" : sourceType === "creator" ? "创作者" : "收藏"}采集任务已创建`, "ok");
       globalThis.CreatorHubWorkbench?.completed?.("collections");
       await refreshCollections();
     } catch (e) {
@@ -5323,7 +5338,7 @@ function collectionTaskSkeleton(count = 3) {
 }
 function collectionTaskEmpty() {
   return `<div class="empty collection-task-empty"><div class="empty-ic">${ic("i-hash")}</div>
-    <div class="empty-t">还没有采集任务</div><div class="empty-sub">可按关键词、创作者主页或小红书收藏创建任务。</div><button class="ghost sm" data-open-composer="collections">新建采集任务</button></div>`;
+    <div class="empty-t">还没有采集任务</div><div class="empty-sub">可按平台支持的来源创建作品采集任务。</div><button class="ghost sm" data-open-composer="collections">新建采集任务</button></div>`;
 }
 function collectionProgress(job) {
   if (job.status === "done") return 100;
@@ -5344,12 +5359,12 @@ function renderCollectionJobs() {
     const keywordProgress = `${Number(job.processed_keyword_count || 0)}/${Number(job.total_keyword_count || 0)} ${sourceLabel}`;
     const itemProgress = Number(job.current_item_total || 0) > 0
       ? ` · 当前作品 ${Number(job.current_item_index || 0)}/${Number(job.current_item_total || 0)}` : "";
-    const sourceValues = job.source_type === "keyword" ? (job.keywords || []) : [job.source_name || (job.source_type === "favorite_all" ? "全部收藏" : "收藏夹")];
+    const sourceValues = job.source_type === "keyword" ? (job.keywords || []) : [job.source_name || (job.source_type === "account_works" ? "本账号作品" : job.source_type === "favorite_all" ? "全部收藏" : "收藏夹")];
     const keywords = sourceValues.slice(0, 5).map(k => `<span class="meta-chip">${esc(k)}</span>`).join("") +
       (sourceValues.length > 5 ? `<span class="meta-chip more">+${sourceValues.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
     const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
-    const canEdit = canRetry && ["douyin", "xhs"].includes(job.platform);
+    const canEdit = canRetry && ["douyin", "xhs", "kuaishou", "shipinhao"].includes(job.platform);
     const errorText = collectionLastError(job);
     const sortLabel = { general: "综合", latest: "最新", most_liked: "最多点赞" }[job.search_sort] || "综合";
     const timeLabel = { all: "不限时间", day: "一天内", week: "一周内", half_year: "半年内" }[job.publish_time] || "不限时间";
@@ -5374,11 +5389,14 @@ function renderCollectionJobs() {
 }
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
-  if (!$("collection-job-table") || !["douyin", "xhs"].includes(PLATFORM)) return;
+  if (!$("collection-job-table") || !["douyin", "xhs", "kuaishou", "shipinhao"].includes(PLATFORM)) return;
   try {
-    const jobs = await api("/api/collections?platform=" + encodeURIComponent(PLATFORM));
+    const requestedPlatform = PLATFORM;
+    const jobs = await api("/api/collections?platform=" + encodeURIComponent(requestedPlatform));
     if (!isCurrent()) return;
-    COLLECTION_JOBS = jobs;
+    // Keep platform data isolated even if an older backend ignores the filter.
+    COLLECTION_JOBS = (Array.isArray(jobs) ? jobs : [])
+      .filter(job => job.platform === requestedPlatform);
     const active = COLLECTION_JOBS.filter(j => ["pending", "running"].includes(j.status)).length;
     if ($("tb-col")) $("tb-col").textContent = active || COLLECTION_JOBS.length;
     renderCollectionJobs();
@@ -5424,7 +5442,7 @@ async function editCollection(jobId, draft = null) {
     $("ui-body").innerHTML = `
       <fieldset class="ui-form-group"><legend>采集范围</legend>
       ${initial.source_type === "keyword" ? `<div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
-        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
+        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "account_works" ? "本账号作品" : initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
       <div class="form-grid">
         <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`)}</select></div>
         ${job.platform === "douyin" ? '<div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}

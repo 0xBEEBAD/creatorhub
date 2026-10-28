@@ -76,6 +76,16 @@ def test_default_douyin_read_mode_is_labeled_api_first():
     assert "verification_required/风控时进入冷却且不打开浏览器" in help_text
 
 
+def test_default_xhs_read_mode_is_api_direct():
+    assert EngineConfig().xhs_read_mode == "api"
+    html = (Path(__file__).parents[1] / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    control = html.split('id="engine-xhs_read_mode"', 1)[1].split("</select>", 1)[0]
+    assert control.index('<option value="api">API 直连（兼容模式）</option>') \
+        < control.index('<option value="browser">浏览器获取</option>')
+    help_text = html.split('id="engine-xhs-read-help"', 1)[1].split("</p>", 1)[0]
+    assert "默认使用 API 直连" in help_text
+
+
 def test_default_douyin_write_mode_is_labeled_api_first():
     assert EngineConfig().douyin_write_mode == "hybrid"
     html = (Path(__file__).parents[1] / "app" / "web" / "index.html").read_text(encoding="utf-8")
@@ -153,7 +163,7 @@ def test_all_supported_values_and_live_downloader(local_project, monkeypatch):
     assert engine.cfg is cfg and not engine._xhs_browser_reads_enabled()
     reset = request("PUT", response.json()["defaults"])
     assert reset.status_code == 200
-    assert cfg.engine.xhs_read_mode == "browser" and cfg.engine.xhs_comment_review_before_publish
+    assert cfg.engine.xhs_read_mode == "api" and cfg.engine.xhs_comment_review_before_publish
     assert not cfg.engine.work_health_enabled
 
 

@@ -12,7 +12,7 @@ engine:
   xhs_browser_mode: auto          # auto=优先每账号系统 Chrome CDP;cdp=严格 CDP;patchright=直接使用 Patchright
   resident_browser_sessions: true # reuse one account browser process/Profile/task page
   browser_session_idle_seconds: 1800 # idle recycle; 0=LRU/explicit close/shutdown only
-  xhs_read_mode: browser          # browser=读取也复用账号浏览器;api=显式签名 API 兼容模式
+  xhs_read_mode: api              # api=常驻Node签名直连（默认）;browser=复用账号浏览器
   douyin_read_mode: hybrid         # hybrid=API优先，普通兼容失败才回退浏览器；验证/风控直接冷却
   douyin_profile_mode: hybrid      # 手动刷新资料:hybrid/API/browser
   douyin_followers_mode: hybrid    # 粉丝同步:hybrid/API/browser

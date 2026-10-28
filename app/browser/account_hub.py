@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin
 
@@ -376,6 +377,13 @@ def _avatar_of(d: dict) -> str:
     return ""
 
 
+def _console_safe(value) -> str:
+    """Return diagnostic text that is printable on Windows GBK consoles."""
+    text = str(value)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
+
+
 def _harvest_user_lists(node, out: List[dict], depth: int = 0):
     """递归找出「元素像用户对象的数组」,把这些用户对象收集起来。"""
     if depth > 8:
@@ -448,7 +456,7 @@ _FOLLOW_NAV = {
     },
     "kuaishou": {
         "url": "https://www.kuaishou.com/profile/{uid}",
-        "open": {"following": ['text=关注'], "fan": ['text=粉丝']},
+        "open": {"following": ['ksstat:关注'], "fan": ['ksstat:粉丝']},
     },
 }
 # 抖音:主页统计区里「关注」没有 data-e2e(只有编译 hash class),而「粉丝/获赞」有。
@@ -508,6 +516,24 @@ async def _click_xhs_profile_stat(mgr: BrowserManager, page, label: str) -> bool
     target = max(scored, key=lambda row: (row[0], row[1]))[2]
     await mgr.xhs_interaction.click_visible(target)
     return True
+
+
+async def _click_ks_profile_stat(page, label: str) -> bool:
+    """Click the owner profile counter, never the sidebar follow-feed link."""
+    counters = page.locator(".profile-top .count span.isOwner")
+    for index in range(min(await counters.count(), 8)):
+        item = counters.nth(index)
+        try:
+            if not await item.is_visible():
+                continue
+            text = re.sub(r"\s+", "", await item.inner_text())
+            if label not in text:
+                continue
+            await item.click(timeout=4000)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 # 小红书关注/粉丝列表:数据渲染在弹层 DOM 里、不发独立 XHR(实测 api_seen 无列表接口),
@@ -586,7 +612,10 @@ _FOLLOW_PRECISE = {
     # 和首屏时间游标；平台签名升级导致直连失效时，hybrid 仍可回退到这里。
     "douyin":   {"following": ("following/list",), "fan": ("follower/list",)},
     "xhs":      {"following": ("followings", "/follows"), "fan": ("fans", "/followers")},
-    "kuaishou": {"following": (), "fan": ()},   # 快手走 graphql visionProfileUserList(见下)
+    "kuaishou": {
+        "following": ("/rest/v/relation/fol",),
+        "fan": ("/rest/v/relation/fol",),
+    },
 }
 
 
@@ -681,9 +710,20 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         # 据此把解析对准(实测粉丝只抽出 1 个、关注抽出 0 个,需看真实结构)
         if platform == "kuaishou" and len(ks_samples) < 6:
             body = str(data)
-            if any(k in body for k in ("user_name", "userName", "nickname", "headurl",
-                                       "fols", "userList", "\"fan\"", "following")):
-                ks_samples.append(f"{path} => {body[:700]}")
+            post_data = str(getattr(resp.request, "post_data", "") or "")
+            operation = ""
+            if post_data:
+                try:
+                    operation = str(json.loads(post_data).get("operationName") or "")
+                except Exception:
+                    operation = post_data[:120]
+            data_keys = list((data.get("data") or {}).keys()) \
+                if isinstance(data, dict) and isinstance(data.get("data"), dict) else []
+            if path == "/graphql" or any(k in body for k in (
+                    "user_name", "userName", "nickname", "headurl",
+                    "headerUrl", "fols", "userList", "\"fan\"", "following")):
+                ks_samples.append(
+                    f"{path} op={operation} keys={data_keys} => {body[:700]}")
         precise = _is_follow_api(path.lower(), data)
         if precise and isinstance(data, dict) and data.get("status_code") in (None, 0, "0"):
             precise_response_seen = True
@@ -693,6 +733,8 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
             expected_key = "followers" if direction == "fan" else "followings"
             if platform == "douyin" and isinstance(data.get(expected_key), list):
                 precise_empty_confirmed = len(data[expected_key]) == 0
+            elif platform == "kuaishou" and isinstance(data.get("fols"), list):
+                precise_empty_confirmed = len(data["fols"]) == 0
         found: List[dict] = []
         _harvest_user_lists(data, found)
         if not found:
@@ -743,6 +785,10 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                 elif cand.startswith("xhs:"):
                     clicked = await _click_xhs_profile_stat(
                         mgr, page, cand[4:])
+                    if not clicked:
+                        continue
+                elif cand.startswith("ksstat:"):
+                    clicked = await _click_ks_profile_stat(page, cand[7:])
                     if not clicked:
                         continue
                 elif cand.startswith("text="):
@@ -847,10 +893,6 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
     result = collected
     if platform == "xhs" and not result and scraped:
         result = scraped
-    # 快手:两方向各自独立导航(粉丝 REST relation / 关注 myFollow graphql),不会互相串,
-    # 故精确为空时用 broad 兜底(broad 就是当前方向 harvest 到的用户)。
-    if platform == "kuaishou" and not result and broad:
-        result = broad
     # 标定期:无论成败都打日志,便于把真实接口固化进 _FOLLOW_PRECISE / _norm_follow_user
     scraped_n = len(scraped) if platform == "xhs" else 0
     print(f"[follow] platform={platform} dir={direction} uid={uid} "
@@ -863,7 +905,7 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
     # 快手:打样本(粉丝只抽出 1 个 / 关注抽出 0 个时,据真实结构对准解析)
     if platform == "kuaishou":
         for i, smp in enumerate(ks_samples):
-            print(f"[follow-ks {direction} {i}] {smp}")
+            print(_console_safe(f"[follow-ks {direction} {i}] {smp}"))
     if not result:
         if precise_empty_confirmed:
             error = "empty"

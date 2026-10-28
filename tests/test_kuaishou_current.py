@@ -1,8 +1,21 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import app.main  # noqa: F401 - initializes the package import graph used by browser modules
-from app.browser.ks_fetcher import _dig_comments, _extract_rest_profile
+from app.browser.account_hub import (
+    _FOLLOW_NAV,
+    _click_ks_profile_stat,
+    _console_safe,
+    _harvest_user_lists,
+    _norm_follow_user,
+)
+from app.browser.ks_fetcher import (
+    _dig_comments,
+    _extract_rest_profile,
+    fetch_ks_search,
+)
 from app.browser.login import (
     _KS_HOME_URL,
     _click_ks_login_button,
@@ -107,6 +120,86 @@ class _UploadPage:
         return _UploadButtonLocator([self.button])
 
 
+class _SearchResponse:
+    def __init__(self, url, payload, post_data=""):
+        self.url = url
+        self.status = 200
+        self._payload = payload
+        self.request = SimpleNamespace(post_data=post_data)
+
+    async def json(self):
+        return self._payload
+
+
+class _SearchMouse:
+    async def wheel(self, *_args):
+        return None
+
+
+class _SearchPage:
+    def __init__(self, responses):
+        self.responses = responses
+        self.url = "about:blank"
+        self.mouse = _SearchMouse()
+        self.callback = None
+        self.closed = False
+
+    def on(self, event, callback):
+        assert event == "response"
+        self.callback = callback
+
+    async def goto(self, url, **_kwargs):
+        self.url = url
+        for response in self.responses:
+            await self.callback(response)
+
+    async def wait_for_timeout(self, _value):
+        return None
+
+    async def evaluate(self, _script):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+
+class _Counter:
+    def __init__(self, text, visible=True):
+        self.text = text
+        self.visible = visible
+        self.clicked = False
+
+    async def is_visible(self):
+        return self.visible
+
+    async def inner_text(self):
+        return self.text
+
+    async def click(self, **_kwargs):
+        self.clicked = True
+
+
+class _CounterLocator:
+    def __init__(self, counters):
+        self.counters = counters
+
+    async def count(self):
+        return len(self.counters)
+
+    def nth(self, index):
+        return self.counters[index]
+
+
+class _CounterPage:
+    def __init__(self, counters):
+        self.counters = counters
+        self.selector = ""
+
+    def locator(self, selector):
+        self.selector = selector
+        return _CounterLocator(self.counters)
+
+
 class KuaishouLoginTests(unittest.TestCase):
     def test_login_opens_rendered_recommendation_page(self):
         self.assertEqual(_KS_HOME_URL, "https://www.kuaishou.com/new-reco")
@@ -157,6 +250,50 @@ class KuaishouProfileTests(unittest.TestCase):
         self.assertEqual(parsed["gender"], "M")
 
 
+class KuaishouFollowSyncTests(unittest.TestCase):
+    def test_navigation_uses_owner_profile_counters_not_sidebar_text(self):
+        self.assertEqual(_FOLLOW_NAV["kuaishou"]["open"]["following"],
+                         ["ksstat:关注"])
+        self.assertEqual(_FOLLOW_NAV["kuaishou"]["open"]["fan"],
+                         ["ksstat:粉丝"])
+
+    def test_exact_profile_counter_selects_each_direction(self):
+        following = _Counter("关注 3")
+        fan = _Counter("粉丝 2")
+        page = _CounterPage([following, fan])
+
+        clicked = asyncio.run(_click_ks_profile_stat(page, "粉丝"))
+
+        self.assertTrue(clicked)
+        self.assertEqual(page.selector, ".profile-top .count span.isOwner")
+        self.assertFalse(following.clicked)
+        self.assertTrue(fan.clicked)
+
+    def test_current_relation_payload_is_parsed_without_cross_direction_flags(self):
+        payload = {"result": 1, "fols": [{
+            "user_id": "3x-user", "user_name": "测试用户",
+            "headurl": "https://img.example/user.jpg",
+            "user_text": "签名", "isFollowing": True,
+        }]}
+        found = []
+        _harvest_user_lists(payload, found)
+
+        following = _norm_follow_user(found[0], "following")
+        fan = _norm_follow_user(found[0], "fan")
+
+        self.assertEqual(following["uid"], "3x-user")
+        self.assertTrue(following["is_following"])
+        self.assertEqual(fan["uid"], "3x-user")
+        self.assertTrue(fan["is_following"])
+
+    def test_diagnostic_with_emoji_is_gbk_printable(self):
+        with patch("app.browser.account_hub.sys.stdout",
+                   SimpleNamespace(encoding="gbk")):
+            safe = _console_safe("昵称🖇️")
+        safe.encode("gbk")
+        self.assertIn("U0001f587", safe)
+
+
 class KuaishouCommentTests(unittest.TestCase):
     def test_graphql_root_comments_v2_and_replies_are_parsed(self):
         reply = {
@@ -176,6 +313,35 @@ class KuaishouCommentTests(unittest.TestCase):
         self.assertEqual([item["commentId"] for item in flattened],
                          ["root-1", "reply-1"])
         self.assertEqual(parse_ks_comment(flattened[0])["text"], "评论")
+
+
+class KuaishouSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_and_graphql_search_responses_are_deduplicated(self):
+        def feed(photo_id):
+            return {"photo": {"id": photo_id,
+                              "photoUrl": f"https://media.test/{photo_id}.mp4"}}
+
+        responses = [
+            _SearchResponse(
+                "https://www.kuaishou.com/rest/v/search/feed",
+                {"data": {"feeds": [feed("p1"), feed("known")]}}),
+            _SearchResponse(
+                "https://www.kuaishou.com/graphql",
+                {"data": {"visionSearchPhoto": {
+                    "feeds": [feed("p1"), feed("p2")]}}},
+                '{"operationName":"visionSearchPhoto"}'),
+        ]
+        page = _SearchPage(responses)
+        manager = SimpleNamespace(new_page=AsyncMock(return_value=page))
+
+        values, error = await fetch_ks_search(
+            manager, SimpleNamespace(), "露营 装备", {"known"},
+            max_scrolls=1, settle_ms=0)
+
+        self.assertEqual(error, "")
+        self.assertEqual([item["photo"]["id"] for item in values], ["p1", "p2"])
+        self.assertIn("searchKey=%E9%9C%B2%E8%90%A5%20%E8%A3%85%E5%A4%87", page.url)
+        self.assertTrue(page.closed)
 
 
 class KuaishouPublishRouteTests(unittest.TestCase):

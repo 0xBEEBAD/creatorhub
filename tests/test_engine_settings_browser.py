@@ -34,7 +34,7 @@ def test_workbench_engine_settings_save_draft_and_recommended_values(ui):
     expect(page.locator("#engine-comment_recent_works")).to_have_value("5")
     assert not page.locator("#engine-settings-advanced").evaluate("el => el.open")
     assert not page.locator("#engine-settings-health").evaluate("el => el.open")
-    mode(page)
+    expect(page.locator("#engine-xhs_read_mode")).to_have_value("api")
     page.locator("#engine-comment_recent_works").fill("9")
     expect(page.locator("#engine-settings-status")).to_contain_text("未保存")
     navigate(page, "overview")
@@ -48,13 +48,13 @@ def test_workbench_engine_settings_save_draft_and_recommended_values(ui):
     page.locator("#engine-settings-save").click()
     expect(page.locator("#engine-settings-status")).to_contain_text("已保存")
     assert json.loads(page.locator("html").get_attribute("data-fixture-engine-body")) == {
-        "xhs_read_mode": "api", "comment_recent_works": 9, "work_health_interval_seconds": 5400,
+        "comment_recent_works": 9, "work_health_interval_seconds": 5400,
     }
     page.evaluate("document.dispatchEvent(new Event('fixture-engine-state'))")
     assert page.locator("html").get_attribute("data-fixture-engine-dirty") == "false"
     page.locator("#engine-settings-defaults").click()
     expect(page.locator("#engine-settings-status")).to_contain_text("点击保存后生效")
-    expect(page.locator("#engine-xhs_read_mode")).to_have_value("browser")
+    expect(page.locator("#engine-xhs_read_mode")).to_have_value("api")
     assert page.locator("html").get_attribute("data-fixture-engine-count") == "1"
     page.locator("#engine-settings-save").click()
     expect(page.locator("#engine-settings-status")).to_contain_text("已保存")
